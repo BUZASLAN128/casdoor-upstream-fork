@@ -156,11 +156,13 @@ func (c *ApiController) IsAdminOrSelf(user2 *object.User) bool {
 	if isGlobalAdmin {
 		return true
 	}
+	return isAdminOrSelf(user, user2)
+}
 
+func isAdminOrSelf(user, user2 *object.User) bool {
 	if user == nil || user2 == nil {
 		return false
 	}
-
 	return user.Owner == user2.Owner && (user.IsAdmin || user.Name == user2.Name)
 }
 

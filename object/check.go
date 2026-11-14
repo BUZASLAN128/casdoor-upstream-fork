@@ -646,12 +646,15 @@ func IsUserOfApplication(user *User, application *Application) (bool, error) {
 	if user.IsGlobalAdmin() || user.Owner == application.Organization || application.IsShared || application.IsExternalUser(user) {
 		return true, nil
 	}
+	if application.Organization != "built-in" {
+		return false, nil
+	}
 
 	organization, err := getOrganization("admin", user.Owner)
 	if err != nil {
 		return false, err
 	}
-	return organization != nil && organization.DefaultApplication == application.Name && application.Organization == "built-in", nil
+	return organization != nil && organization.DefaultApplication == application.Name, nil
 }
 
 func CheckPasswordOnlySignin(user *User, clientIp string, lang string) error {

@@ -16,7 +16,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: cerberus-casdoor-image-${{ github.ref }}
+  group: cerberus-casdoor-image-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -37,10 +37,51 @@ jobs:
           cache: true
 
       - name: Verify Cerberus security invariants
-        run: go test -mod=readonly ./object -run 'TestApplicationIsSignupAllowedForBindsOrganization|TestSafeAdapter' -count=1
+        run: >-
+          go test -mod=readonly ./object ./controllers
+          -run 'TestApplicationIsSignupAllowedForBindsOrganization|TestSafeAdapter|TestCerberusSecurity'
+          -count=1
 
       - name: Compile every Go package
         run: go test -mod=readonly -tags skipCi -run '^$' ./...
+
+      - name: Start the owned disposable CockroachDB
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '127.0.0.1 casdoor-safe-adapter-crdb' | sudo tee -a /etc/hosts >/dev/null
+          docker run --detach --name casdoor-safe-adapter-crdb --network host --memory 2g \
+            cockroachdb/cockroach@sha256:a0a144676e1648929f2838c3574d2ac02f1d29186f66207fc0149c7f3f9bcb6d \
+            start-single-node --insecure --listen-addr=127.0.0.1:26257 \
+            --http-addr=127.0.0.1:18080 --store=type=mem,size=1GiB \
+            --cache=256MiB --max-sql-memory=512MiB
+          for attempt in {1..60}; do
+            if docker exec casdoor-safe-adapter-crdb /cockroach/cockroach sql \
+              --insecure --host=127.0.0.1:26257 --execute='SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            if [[ ${attempt} -eq 60 ]]; then
+              echo '::error::Disposable CockroachDB did not become ready'
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec casdoor-safe-adapter-crdb /cockroach/cockroach sql \
+            --insecure --host=127.0.0.1:26257 \
+            --execute='CREATE DATABASE casdoor_safe_adapter_test'
+
+      - name: Verify SafeAdapter against disposable CockroachDB
+        env:
+          CASDOOR_COCKROACH_TEST_ALLOW_DISPOSABLE: casdoor-safe-adapter-crdb
+          CASDOOR_COCKROACH_TEST_DSN: postgresql://root@casdoor-safe-adapter-crdb:26257/casdoor_safe_adapter_test?sslmode=disable
+        run: >-
+          go test -mod=readonly -tags integration ./object
+          -run '^TestSafeAdapterCockroachRepeatedWritesPreserveCustomTable$'
+          -count=1
+
+      - name: Stop the owned disposable CockroachDB
+        if: always()
+        run: docker rm --force casdoor-safe-adapter-crdb >/dev/null 2>&1 || true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
