@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25.8@sha256:3ac2864710f25e84381bf5d4272261c7ba73ada0339d62034df4de20dabb33ca AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10@sha256:cfa27959837144bf4649802ba38e59daffd0dd2a7994aa83daaf113285b0f551 AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -7,7 +7,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=readonly -trimpath -ldflags="-w -s" -o /out/server .
 
-FROM --platform=$TARGETPLATFORM casbin/casdoor:4.7.0@sha256:9d015582847d40c1d013ee7f2d746cb835a3ad4d72c82e23980b2a269809e4c3
+FROM --platform=$TARGETPLATFORM casbin/casdoor:v4.27.1@sha256:a0499a9e1bc0c089af79f19b16b866432bc9519a495e286ac7c558181c302b2a
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL org.opencontainers.image.version="v4.27.1-cerberus.1"
 COPY --from=builder /out/server /server
