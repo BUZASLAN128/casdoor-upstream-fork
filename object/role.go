@@ -238,6 +238,16 @@ func getRolesByUserInternal(userId string) ([]*Role, map[string][]string, error)
 	if user == nil {
 		return nil, nil, fmt.Errorf("The user: %s doesn't exist", userId)
 	}
+	return getRolesBySuppliedUserInternal(userId, user)
+}
+
+// getRolesBySuppliedUserInternal resolves direct and group role assignments
+// from the supplied user. Signup uses this before the account is persisted, so
+// role policies cannot be bypassed merely because GetUser cannot find it yet.
+func getRolesBySuppliedUserInternal(userId string, user *User) ([]*Role, map[string][]string, error) {
+	if user == nil {
+		return nil, nil, fmt.Errorf("The user: %s doesn't exist", userId)
+	}
 
 	query := ormer.Engine.Alias("r").Where("r.users like ?", fmt.Sprintf("%%%s%%", userId))
 	for _, group := range user.Groups {
@@ -245,7 +255,7 @@ func getRolesByUserInternal(userId string) ([]*Role, map[string][]string, error)
 	}
 
 	roles := []*Role{}
-	err = query.Find(&roles)
+	err := query.Find(&roles)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -254,22 +264,30 @@ func getRolesByUserInternal(userId string) ([]*Role, map[string][]string, error)
 	// a source is the group that granted the role, "" means it was assigned directly
 	sources := map[string][]string{}
 	for _, role := range roles {
-		roleSources := []string{}
-		if util.InSlice(role.Users, userId) {
-			roleSources = append(roleSources, "")
-		}
-		for _, group := range role.Groups {
-			if util.InSlice(user.Groups, group) {
-				roleSources = append(roleSources, group)
-			}
-		}
-
+		roleSources := getRoleSourcesForSuppliedUser(role, userId, user)
 		if len(roleSources) != 0 {
 			res = append(res, role)
 			sources[role.GetId()] = roleSources
 		}
 	}
 	return res, sources, nil
+}
+
+func getRoleSourcesForSuppliedUser(role *Role, userId string, user *User) []string {
+	if role == nil || user == nil {
+		return nil
+	}
+
+	roleSources := []string{}
+	if util.InSlice(role.Users, userId) {
+		roleSources = append(roleSources, "")
+	}
+	for _, group := range role.Groups {
+		if util.InSlice(user.Groups, group) {
+			roleSources = append(roleSources, group)
+		}
+	}
+	return roleSources
 }
 
 func fillSourceGroups(roles []*Role, sources map[string][]string) {
@@ -313,10 +331,9 @@ func fillSourceGroups(roles []*Role, sources map[string][]string) {
 	}
 }
 
-func getRolesByUser(userId string) ([]*Role, error) {
-	roles, sources, err := getRolesByUserInternal(userId)
-	if err != nil {
-		return nil, err
+func expandRolesByUserSources(roles []*Role, sources map[string][]string) ([]*Role, error) {
+	if len(roles) == 0 {
+		return []*Role{}, nil
 	}
 
 	allRolesIds := []string{}
@@ -336,6 +353,22 @@ func getRolesByUser(userId string) ([]*Role, error) {
 	}
 
 	return allRoles, nil
+}
+
+func getRolesBySuppliedUser(userId string, user *User) ([]*Role, error) {
+	roles, sources, err := getRolesBySuppliedUserInternal(userId, user)
+	if err != nil {
+		return nil, err
+	}
+	return expandRolesByUserSources(roles, sources)
+}
+
+func getRolesByUser(userId string) ([]*Role, error) {
+	roles, sources, err := getRolesByUserInternal(userId)
+	if err != nil {
+		return nil, err
+	}
+	return expandRolesByUserSources(roles, sources)
 }
 
 func roleChangeTrigger(owner string, oldName string, newName string) error {

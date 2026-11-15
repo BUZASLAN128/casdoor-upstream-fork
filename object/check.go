@@ -786,6 +786,55 @@ func enforceLoginPermissionGroups(enforcer loginPermissionEnforcer, groupSubject
 	return allowCount, denyCount, nil
 }
 
+func getMatchingLoginPermissionRoles(permission *Permission, targetRoles []*Role) (bool, []*Role) {
+	matchingRoles := []*Role{}
+	seen := map[string]bool{}
+	for _, permissionRole := range permission.Roles {
+		if permissionRole == "*" {
+			return true, targetRoles
+		}
+
+		for _, targetRole := range targetRoles {
+			roleId := targetRole.GetId()
+			if permissionRole == roleId && !seen[roleId] {
+				matchingRoles = append(matchingRoles, targetRole)
+				seen[roleId] = true
+			}
+		}
+	}
+	return len(matchingRoles) > 0, matchingRoles
+}
+
+func resolveLoginPermissionRoles(permission *Permission, userId string, user *User) (bool, []*Role, error) {
+	if len(permission.Roles) == 0 {
+		return false, nil, nil
+	}
+
+	targetRoles, err := getRolesBySuppliedUser(userId, user)
+	if err != nil {
+		return false, nil, err
+	}
+	roleHit, matchingRoles := getMatchingLoginPermissionRoles(permission, targetRoles)
+	return roleHit, matchingRoles, nil
+}
+
+func enforceLoginPermissionRoles(enforcer loginPermissionEnforcer, roles []*Role, applicationName, effect string) (int, int, error) {
+	allowCount := 0
+	denyCount := 0
+	for _, role := range roles {
+		isAllowed, err := enforcer.Enforce(role.GetId(), applicationName, "Read")
+		if err != nil {
+			return 0, 0, err
+		}
+		if isAllowed && effect == "Allow" {
+			allowCount++
+		} else if !isAllowed && effect == "Deny" {
+			denyCount++
+		}
+	}
+	return allowCount, denyCount, nil
+}
+
 func checkLoginPermission(userId string, user *User, application *Application) (bool, error) {
 	owner, _, err := util.GetOwnerAndNameFromIdWithError(userId)
 	if err != nil {
@@ -821,7 +870,10 @@ func checkLoginPermission(userId string, user *User, application *Application) (
 		userHit := permission.isUserHit(userId)
 		groupSubjects := permission.getGroupSubjectsForUser(user)
 		groupHit := len(groupSubjects) > 0
-		roleHit := permission.isRoleHit(userId)
+		roleHit, matchingRoles, err := resolveLoginPermissionRoles(permission, userId, user)
+		if err != nil {
+			return false, err
+		}
 		if (groupHit || roleHit) && !isRbacAllowed() {
 			return false, requireRbac()
 		}
@@ -867,39 +919,12 @@ func checkLoginPermission(userId string, user *User, application *Application) (
 			denyCount += groupDenies
 		}
 		if roleHit {
-			targetRoles, err := getRolesByUser(userId)
+			roleAllows, roleDenies, err := enforceLoginPermissionRoles(enforcer, matchingRoles, application.Name, permission.Effect)
 			if err != nil {
 				return false, err
 			}
-
-			var checkRoleList []*Role
-
-			for _, role := range permission.Roles {
-				if role == "*" {
-					checkRoleList = targetRoles
-					break
-				}
-
-				for _, targetRole := range targetRoles {
-					if role == targetRole.GetId() {
-						checkRoleList = append(checkRoleList, targetRole)
-					}
-				}
-			}
-
-			for _, role := range checkRoleList {
-				isAllowed, err = enforcer.Enforce(role.GetId(), application.Name, "Read")
-
-				if isAllowed {
-					if permission.Effect == "Allow" {
-						allowCount += 1
-					}
-				} else {
-					if permission.Effect == "Deny" {
-						denyCount += 1
-					}
-				}
-			}
+			allowCount += roleAllows
+			denyCount += roleDenies
 		}
 	}
 
