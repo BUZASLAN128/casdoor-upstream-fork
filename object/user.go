@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1010,14 +1011,12 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 		columns = append(columns, "deleted_time")
 	}
 
+	var affected int64
 	if util.InSlice(columns, "groups") {
-		_, err := userEnforcer.UpdateGroupsForUser(user.GetId(), user.Groups)
-		if err != nil {
-			return false, err
-		}
+		affected, err = updateUserGroupsWithGovernance(id, user, columns)
+	} else {
+		affected, err = updateUser(id, user, columns)
 	}
-
-	affected, err := updateUser(id, user, columns)
 	if err != nil {
 		return false, err
 	}
@@ -1035,6 +1034,53 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	}
 
 	return affected != 0, nil
+}
+
+func updateUserGroupsWithGovernance(id string, user *User, columns []string) (int64, error) {
+	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return 0, err
+	}
+	rollback := func(err error) (int64, error) {
+		_ = session.Rollback()
+		return 0, err
+	}
+	if err := lockGovernanceScopes(session, owner, user.Owner); err != nil {
+		return rollback(err)
+	}
+	stored := &User{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		return rollback(fmt.Errorf("the user: %s is not found", id))
+	}
+	if err = CheckUserSodInSession(session, stored, user, ""); err != nil {
+		return rollback(err)
+	}
+	if err = user.UpdateUserHash(); err != nil {
+		return rollback(err)
+	}
+	if !util.InSlice(columns, "hash") {
+		columns = append(columns, "hash")
+	}
+	affected, err := session.ID(core.PK{owner, name}).Cols(columns...).Update(user)
+	if err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.publishCommittedGroups(); err != nil {
+		return 0, err
+	}
+	return affected, nil
 }
 
 func updateUser(id string, user *User, columns []string) (int64, error) {
@@ -1092,14 +1138,10 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 
 	user.UpdatedTime = util.GetCurrentTime()
 
-	if len(user.Groups) > 0 {
-		_, err = userEnforcer.UpdateGroupsForUser(user.GetId(), user.Groups)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(user)
+	// AllCols always writes groups, even when this caller's earlier snapshot
+	// happens to match. Re-read and validate under the organization lock so a
+	// concurrent membership change cannot be restored from stale profile data.
+	affected, err := updateUserAllFieldsGroupsWithGovernance(id, user)
 	if err != nil {
 		return false, err
 	}
@@ -1116,6 +1158,47 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 	}
 
 	return affected != 0, nil
+}
+
+func updateUserAllFieldsGroupsWithGovernance(id string, user *User) (int64, error) {
+	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return 0, err
+	}
+	rollback := func(err error) (int64, error) {
+		_ = session.Rollback()
+		return 0, err
+	}
+	if err := lockGovernanceScopes(session, owner, user.Owner); err != nil {
+		return rollback(err)
+	}
+	stored := &User{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		return rollback(fmt.Errorf("the user: %s is not found", id))
+	}
+	if err = CheckUserSodInSession(session, stored, user, ""); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(user)
+	if err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.publishCommittedGroups(); err != nil {
+		return 0, err
+	}
+	return affected, nil
 }
 
 func AddUser(user *User, lang string) (bool, error) {
@@ -1221,20 +1304,41 @@ func AddUser(user *User, lang string) (bool, error) {
 		user.Ranking = int(count + 1)
 	}
 
-	if user.Groups != nil && len(user.Groups) > 0 {
-		_, err = userEnforcer.UpdateGroupsForUser(user.GetId(), user.Groups)
-		if err != nil {
-			return false, err
-		}
-	}
-
 	isUsernameLowered := conf.GetConfigBool("isUsernameLowered")
 	if isUsernameLowered {
 		user.Name = strings.ToLower(user.Name)
 	}
+	if err = user.UpdateUserHash(); err != nil {
+		return false, err
+	}
+	user.PreHash = user.Hash
 
-	affected, err := ormer.Engine.Insert(user)
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockGovernanceScope(session, user.Owner); err != nil {
+		return rollback(err)
+	}
+	if err = CheckUserSodInSession(session, nil, user, lang); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.Insert(user)
 	if err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.publishCommittedGroups(); err != nil {
 		return false, err
 	}
 
@@ -1273,24 +1377,62 @@ func AddUsers(users []*User) (bool, error) {
 			return false, err
 		}
 
-		if user.Groups != nil && len(user.Groups) > 0 {
-			_, err = userEnforcer.UpdateGroupsForUser(user.GetId(), user.Groups)
-			if err != nil {
-				return false, err
-			}
-		}
-
 		user.Name = strings.TrimSpace(user.Name)
 		if isUsernameLowered {
 			user.Name = strings.ToLower(user.Name)
 		}
-	}
-
-	affected, err := ormer.Engine.Insert(users)
-	if err != nil {
-		if !strings.Contains(err.Error(), "Duplicate entry") {
+		if err = user.UpdateUserHash(); err != nil {
 			return false, err
 		}
+		user.PreHash = user.Hash
+	}
+
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	owners := map[string]bool{}
+	for _, user := range users {
+		owners[user.Owner] = true
+	}
+	ownerNames := make([]string, 0, len(owners))
+	for owner := range owners {
+		ownerNames = append(ownerNames, owner)
+	}
+	sort.Strings(ownerNames)
+	for _, owner := range ownerNames {
+		if err := lockGovernanceScope(session, owner); err != nil {
+			return rollback(err)
+		}
+	}
+	for _, user := range users {
+		if err := CheckUserSodInSession(session, nil, user, ""); err != nil {
+			return rollback(err)
+		}
+	}
+	affected, err := session.Insert(users)
+	if err != nil {
+		if !strings.Contains(err.Error(), "Duplicate entry") {
+			return rollback(err)
+		}
+		_ = session.Rollback()
+		return false, nil
+	}
+	for _, user := range users {
+		if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+			return rollback(err)
+		}
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.publishCommittedGroups(); err != nil {
+		return false, err
 	}
 
 	return affected != 0, nil
@@ -1659,21 +1801,53 @@ func ExtendUserWithRolesAndPermissions(user *User) (err error) {
 }
 
 func DeleteGroupForUser(user string, group string) (bool, error) {
-	userObj, err := GetUser(user)
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(user)
 	if err != nil {
 		return false, err
 	}
-	if userObj == nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockGovernanceScope(session, owner); err != nil {
+		return rollback(err)
+	}
+	userObj := &User{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(userObj)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
 		return false, fmt.Errorf(i18n.Translate("en", "general:The user: %s doesn't exist"), user)
 	}
-
+	oldGroups := append([]string{}, userObj.Groups...)
 	userObj.Groups = util.DeleteVal(userObj.Groups, group)
-	_, err = updateUser(user, userObj, []string{"groups"})
-	if err != nil {
+	if util.StructToJson(oldGroups) == util.StructToJson(userObj.Groups) {
+		_ = session.Rollback()
+		return false, nil
+	}
+	if err = userObj.UpdateUserHash(); err != nil {
+		return rollback(err)
+	}
+	if _, err = session.ID(core.PK{owner, name}).Cols("groups", "hash").Update(userObj); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.replaceGroupsForUserInSession(session, userObj.GetId(), userObj.Groups); err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	if err = userEnforcer.publishCommittedGroups(); err != nil {
 		return false, err
 	}
-
-	return userEnforcer.DeleteGroupForUser(user, group)
+	return true, nil
 }
 
 func userChangeTrigger(owner string, oldName string, newName string) error {

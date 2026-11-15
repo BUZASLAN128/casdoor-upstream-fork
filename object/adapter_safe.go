@@ -8,8 +8,9 @@ import (
 
 type SafeAdapter struct {
 	*xormadapter.Adapter
-	engine    *xorm.Engine
-	tableName string
+	engine       *xorm.Engine
+	tableName    string
+	sameDatabase bool
 }
 
 type safeCasbinRule struct {
@@ -38,9 +39,10 @@ func NewSafeAdapter(a *Adapter) *SafeAdapter {
 	}
 
 	return &SafeAdapter{
-		Adapter:   a.Adapter,
-		engine:    a.engine,
-		tableName: a.Table,
+		Adapter:      a.Adapter,
+		engine:       a.engine,
+		tableName:    a.Table,
+		sameDatabase: a.UseSameDb || a.isBuiltIn(),
 	}
 }
 

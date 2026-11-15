@@ -17,6 +17,7 @@ package object
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/casdoor/casdoor/conf"
@@ -24,6 +25,7 @@ import (
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/builder"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 type Group struct {
@@ -205,19 +207,66 @@ func UpdateGroup(id string, group *Group, isGlobalAdmin bool, lang string) (bool
 		return false, err
 	}
 
-	if name != group.Name {
-		err := GroupChangeTrigger(owner, name, group.Name)
-		if err != nil {
-			return false, err
+	return updateGroupWithGovernance(owner, name, group)
+}
+
+func updateGroupWithGovernance(owner string, name string, group *Group) (bool, error) {
+	updated := *group
+	updated.Owner = owner
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, owner); err != nil {
+		return rollback(err)
+	}
+	stored := &Group{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+
+	rename := name != updated.Name
+	if rename {
+		target := &Group{Owner: owner, Name: updated.Name}
+		targetExists, targetErr := session.ForUpdate().Get(target)
+		if targetErr != nil {
+			return rollback(targetErr)
+		}
+		if targetExists {
+			return rollback(fmt.Errorf("the target group already exists: %s", target.GetId()))
+		}
+		if err = groupChangeInSession(session, owner, name, updated.Name); err != nil {
+			return rollback(err)
 		}
 	}
 
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(group)
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(&updated)
 	if err != nil {
-		return false, err
+		return rollback(err)
 	}
-
-	return affected != 0, nil
+	if affected != 1 {
+		return rollback(fmt.Errorf("the group changed while updating it: %s/%s", owner, name))
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*group = updated
+	if rename {
+		if err = userEnforcer.publishCommittedGroups(); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func AddGroup(group *Group) (bool, error) {
@@ -225,12 +274,24 @@ func AddGroup(group *Group) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
-	affected, err := ormer.Engine.Insert(group)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
 		return false, err
 	}
-
+	if err = lockGovernanceScope(session, group.Owner); err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	affected, err := session.Insert(group)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = session.Commit(); err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
 	return affected != 0, nil
 }
 
@@ -238,8 +299,37 @@ func AddGroups(groups []*Group) (bool, error) {
 	if len(groups) == 0 {
 		return false, nil
 	}
-	affected, err := ormer.Engine.Insert(groups)
+	owners := map[string]bool{}
+	for _, group := range groups {
+		if err := checkGroupName(group.Name); err != nil {
+			return false, err
+		}
+		owners[group.Owner] = true
+	}
+	ownerNames := make([]string, 0, len(owners))
+	for owner := range owners {
+		ownerNames = append(ownerNames, owner)
+	}
+	sort.Strings(ownerNames)
+
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	for _, owner := range ownerNames {
+		if err := lockGovernanceScope(session, owner); err != nil {
+			_ = session.Rollback()
+			return false, err
+		}
+	}
+	affected, err := session.Insert(groups)
 	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = session.Commit(); err != nil {
+		_ = session.Rollback()
 		return false, err
 	}
 	return affected != 0, nil
@@ -290,24 +380,75 @@ func deleteGroup(group *Group) (bool, error) {
 }
 
 func DeleteGroup(group *Group) (bool, error) {
-	_, err := ormer.Engine.Get(group)
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, group.Owner); err != nil {
+		return rollback(err)
+	}
+	stored := &Group{Owner: group.Owner, Name: group.Name}
+	existed, err := session.ForUpdate().Get(stored)
 	if err != nil {
-		return false, err
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
 	}
 
-	if count, err := ormer.Engine.Where("owner = ?", group.Owner).And("parent_id = ?", group.Name).Count(&Group{}); err != nil {
-		return false, err
+	if count, err := session.Where("owner = ?", group.Owner).And("parent_id = ?", group.Name).Count(&Group{}); err != nil {
+		return rollback(err)
 	} else if count > 0 {
-		return false, errors.New("group has children group")
+		return rollback(errors.New("group has children group"))
 	}
 
-	if count, err := GetGroupUserCount(group.GetId(), "", ""); err != nil {
-		return false, err
+	groupId := group.GetId()
+	users := []*User{}
+	if err = session.Cols("groups").Where("owner = ?", group.Owner).Find(&users); err != nil {
+		return rollback(err)
+	}
+	for _, user := range users {
+		if util.InSlice(user.Groups, groupId) {
+			return rollback(errors.New("group has users"))
+		}
+	}
+	if count, err := GetGroupUserCount(groupId, "", ""); err != nil {
+		return rollback(err)
 	} else if count > 0 {
-		return false, errors.New("group has users")
+		return rollback(errors.New("group has users"))
 	}
 
-	return deleteGroup(group)
+	roles := []*Role{}
+	if err = session.Where("owner = ?", group.Owner).Find(&roles); err != nil {
+		return rollback(err)
+	}
+	for _, role := range roles {
+		if util.InSlice(role.Groups, groupId) {
+			return rollback(fmt.Errorf("the group cannot be deleted while a role depends on it: %s", groupId))
+		}
+	}
+	count, err := session.Where("owner = ?", group.Owner).And(fmt.Sprintf("%s = ?", quoteColumn("group")), group.Name).Count(&Subscription{})
+	if err != nil {
+		return rollback(err)
+	}
+	if count != 0 {
+		return rollback(fmt.Errorf("the group cannot be deleted while a subscription depends on it: %s", groupId))
+	}
+
+	affected, err := session.ID(core.PK{group.Owner, group.Name}).Delete(&Group{})
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	return affected != 0, nil
 }
 
 func checkGroupName(name string) error {
@@ -483,63 +624,91 @@ func ExtendGroupsWithUsers(groups []*Group) error {
 }
 
 func GroupChangeTrigger(owner string, oldName string, newName string) error {
-	session := ormer.Engine.NewSession()
-	defer session.Close()
-	err := session.Begin()
+	group, err := getGroup(owner, oldName)
 	if err != nil {
 		return err
 	}
+	if group == nil {
+		return fmt.Errorf("the group does not exist: %s/%s", owner, oldName)
+	}
+	group.Name = newName
+	_, err = updateGroupWithGovernance(owner, oldName, group)
+	return err
+}
 
+func groupChangeInSession(session *xorm.Session, owner string, oldName string, newName string) error {
 	oldGroupId := util.GetId(owner, oldName)
 	newGroupId := util.GetId(owner, newName)
-
-	users := []*User{}
-	err = session.Where("owner = ?", owner).And(builder.Like{"`groups`", oldGroupId}).Find(&users)
-	if err != nil {
+	if err := userEnforcer.deleteGroupBindingsInSession(session, oldGroupId); err != nil {
 		return err
 	}
 
+	users := []*User{}
+	if err := session.Where("owner = ?", owner).Find(&users); err != nil {
+		return err
+	}
+	changedUsers := []*User{}
 	for _, user := range users {
+		if !util.InSlice(user.Groups, oldGroupId) {
+			continue
+		}
+		oldUser := *user
+		oldUser.Groups = append([]string{}, user.Groups...)
 		user.Groups = util.ReplaceVal(user.Groups, oldGroupId, newGroupId)
-		_, err := updateUser(user.GetId(), user, []string{"groups"})
-		if err != nil {
+		if err := user.UpdateUserHash(); err != nil {
 			return err
 		}
-		_, err = userEnforcer.UpdateGroupsForUser(user.GetId(), user.Groups)
-		if err != nil {
+		if _, err := session.ID(core.PK{oldUser.Owner, oldUser.Name}).Cols("groups", "hash").Update(user); err != nil {
+			return err
+		}
+		if err := userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+			return err
+		}
+		changedUsers = append(changedUsers, user)
+	}
+
+	roles := []*Role{}
+	if err := session.Where("owner = ?", owner).Find(&roles); err != nil {
+		return err
+	}
+	for _, role := range roles {
+		if !util.InSlice(role.Groups, oldGroupId) {
+			continue
+		}
+		role.Groups = util.ReplaceVal(role.Groups, oldGroupId, newGroupId)
+		if _, err := session.ID(core.PK{role.Owner, role.Name}).Cols("groups").Update(role); err != nil {
+			return err
+		}
+	}
+	// Validate against the complete post-rename snapshot. Checking before role
+	// references move can temporarily hide the source group's grants and miss a
+	// conflict with roles that already point at the destination ID.
+	for _, user := range changedUsers {
+		if err := CheckUserSodInSession(session, nil, user, ""); err != nil {
 			return err
 		}
 	}
 
 	groups := []*Group{}
-	err = session.Where("owner = ?", owner).And("parent_id = ?", oldName).Find(&groups)
-	if err != nil {
+	if err := session.Where("owner = ?", owner).And("parent_id = ?", oldName).Find(&groups); err != nil {
 		return err
 	}
 	for _, group := range groups {
 		group.ParentId = newName
-		_, err := session.ID(core.PK{group.Owner, group.Name}).Cols("parent_id").Update(group)
-		if err != nil {
+		if _, err := session.ID(core.PK{group.Owner, group.Name}).Cols("parent_id").Update(group); err != nil {
 			return err
 		}
 	}
 
 	subscriptions := []*Subscription{}
-	err = session.Where("owner = ?", owner).And(fmt.Sprintf("%s = ?", quoteColumn("group")), oldName).Find(&subscriptions)
-	if err != nil {
+	if err := session.Where("owner = ?", owner).And(fmt.Sprintf("%s = ?", quoteColumn("group")), oldName).Find(&subscriptions); err != nil {
 		return err
 	}
 	for _, subscription := range subscriptions {
 		subscription.Group = newName
-		_, err := session.ID(core.PK{subscription.Owner, subscription.Name}).Cols("group").Update(subscription)
-		if err != nil {
+		if _, err := session.ID(core.PK{subscription.Owner, subscription.Name}).Cols("group").Update(subscription); err != nil {
 			return err
 		}
-	}
-
-	err = session.Commit()
-	if err != nil {
-		return err
 	}
 	return nil
 }

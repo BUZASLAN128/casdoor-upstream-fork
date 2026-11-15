@@ -8,11 +8,61 @@ import (
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casdoor/casdoor/util"
+	"github.com/xorm-io/xorm"
 )
 
 type UserGroupEnforcer struct {
 	// use rbac model implement use group, the enforcer can also implement user role
 	enforcer *casbin.SyncedEnforcer
+}
+
+// replaceGroupsForUserInSession persists the canonical user-group bindings in
+// the caller's transaction. The built-in user enforcer is deliberately backed
+// by Casdoor's own database, so its policy rows and the User.Groups column can
+// commit or roll back together.
+func (e *UserGroupEnforcer) replaceGroupsForUserInSession(session *xorm.Session, user string, groups []string) error {
+	adapter, ok := e.enforcer.GetAdapter().(*SafeAdapter)
+	if !ok || adapter == nil || !adapter.sameDatabase {
+		return fmt.Errorf("the user-group adapter is not backed by Casdoor's database")
+	}
+	tableName := adapter.policyTableName()
+	if _, err := session.Where("ptype = ? AND v0 = ?", "g", user).Delete(&safeCasbinRule{tableName: tableName}); err != nil {
+		return err
+	}
+
+	seen := map[string]bool{}
+	for _, group := range groups {
+		if group == "" || seen[group] {
+			continue
+		}
+		seen[group] = true
+		rule := &safeCasbinRule{Ptype: "g", V0: user, V1: GetGroupWithPrefix(group), tableName: tableName}
+		if _, err := session.InsertOne(rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *UserGroupEnforcer) deleteGroupBindingsInSession(session *xorm.Session, group string) error {
+	adapter, ok := e.enforcer.GetAdapter().(*SafeAdapter)
+	if !ok || adapter == nil || !adapter.sameDatabase {
+		return fmt.Errorf("the user-group adapter is not backed by Casdoor's database")
+	}
+	_, err := session.Where("ptype = ? AND v1 = ?", "g", GetGroupWithPrefix(group)).
+		Delete(&safeCasbinRule{tableName: adapter.policyTableName()})
+	return err
+}
+
+// publishCommittedGroups refreshes the synchronized in-memory model only after
+// the database transaction has committed. If reload fails, clear the model so
+// stale allow bindings cannot outlive the authoritative database state.
+func (e *UserGroupEnforcer) publishCommittedGroups() error {
+	if err := e.LoadPolicy(); err != nil {
+		e.enforcer.ClearPolicy()
+		return fmt.Errorf("reload committed user-group policy: %w", err)
+	}
+	return nil
 }
 
 func NewUserGroupEnforcer(enforcer *casbin.SyncedEnforcer) *UserGroupEnforcer {

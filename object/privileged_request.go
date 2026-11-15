@@ -340,7 +340,7 @@ func updatePamRoleMembershipInSession(session *xorm.Session, request *Privileged
 	}
 	role.Users = updatedUsers
 	if add {
-		if err = CheckRoleSod(role, lang); err != nil {
+		if err = CheckRoleSodInSession(session, role, lang); err != nil {
 			return false, err
 		}
 	}
@@ -382,6 +382,10 @@ func insertActivePamRoleRequest(request *PrivilegedRequest, account *PrivilegedA
 	if err := session.Begin(); err != nil {
 		return err
 	}
+	if err := lockGovernanceScope(session, request.Owner); err != nil {
+		_ = session.Rollback()
+		return err
+	}
 
 	if err := lockEnabledPamRoleAccount(session, request, account, lang); err != nil {
 		_ = session.Rollback()
@@ -412,6 +416,10 @@ func activatePendingPamRoleRequest(request *PrivilegedRequest, account *Privileg
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	if err := lockGovernanceScope(session, request.Owner); err != nil {
+		_ = session.Rollback()
 		return false, err
 	}
 
@@ -471,6 +479,10 @@ func endActivePamRoleRequest(request *PrivilegedRequest, state string) (bool, er
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	if err := lockGovernanceScope(session, request.Owner); err != nil {
+		_ = session.Rollback()
 		return false, err
 	}
 

@@ -21,6 +21,7 @@ import (
 	"github.com/casdoor/casdoor/util"
 	"github.com/robfig/cron/v3"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 func (sub *Subscription) isActiveAt(now time.Time) bool {
@@ -41,12 +42,18 @@ func (sub *Subscription) isActiveAt(now time.Time) bool {
 	return !startTime.After(now) && !endTime.Before(now)
 }
 
-func getPlanRoleId(owner string, planName string) (string, error) {
-	plan, err := getPlan(owner, planName)
-	if err != nil || plan == nil {
+func getPlanRoleIdInSession(session *xorm.Session, owner string, planName string) (string, error) {
+	if owner == "" || planName == "" {
+		return "", fmt.Errorf("the subscription plan identity is empty")
+	}
+	plan := &Plan{}
+	existed, err := session.ID(core.PK{owner, planName}).Get(plan)
+	if err != nil {
 		return "", err
 	}
-
+	if !existed {
+		return "", fmt.Errorf("the plan does not exist: %s/%s", owner, planName)
+	}
 	return plan.GetRoleId(), nil
 }
 
@@ -55,21 +62,47 @@ func syncSubscriptionRole(sub *Subscription) error {
 	if sub == nil {
 		return nil
 	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return err
+	}
+	if err := lockGovernanceScope(session, sub.Owner); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	if err := syncSubscriptionRoleInSession(session, sub); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	if err := session.Commit(); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	return nil
+}
 
-	roleId, err := getPlanRoleId(sub.Owner, sub.Plan)
+func syncSubscriptionRoleInSession(session *xorm.Session, sub *Subscription) error {
+	if sub == nil {
+		return nil
+	}
+	if err := lockGovernanceScope(session, sub.Owner); err != nil {
+		return err
+	}
+	roleId, err := getPlanRoleIdInSession(session, sub.Owner, sub.Plan)
 	if err != nil || roleId == "" {
 		return err
 	}
 
 	if sub.User != "" {
-		err = syncSubscriptionRoleMember(sub.Owner, roleId, "user", sub.User)
+		err = syncSubscriptionRoleMemberInSession(session, sub.Owner, roleId, "user", sub.User)
 		if err != nil {
 			return err
 		}
 	}
 
 	if sub.Group != "" {
-		err = syncSubscriptionRoleMember(sub.Owner, roleId, "group", sub.Group)
+		err = syncSubscriptionRoleMemberInSession(session, sub.Owner, roleId, "group", sub.Group)
 		if err != nil {
 			return err
 		}
@@ -78,9 +111,25 @@ func syncSubscriptionRole(sub *Subscription) error {
 	return nil
 }
 
-func syncSubscriptionRoleMember(owner string, roleId string, column string, memberName string) error {
+func syncSubscriptionRoleMemberInSession(session *xorm.Session, owner string, roleId string, column string, memberName string) error {
+	roleOwner, roleName, err := util.GetOwnerAndNameFromIdWithError(roleId)
+	if err != nil {
+		return err
+	}
+	if roleOwner != owner {
+		return fmt.Errorf("the subscription role is outside its organization: %s", roleId)
+	}
+	role := &Role{Owner: roleOwner, Name: roleName}
+	existed, err := session.ForUpdate().Get(role)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return fmt.Errorf("the subscription role does not exist: %s", roleId)
+	}
+
 	subscriptions := []*Subscription{}
-	err := ormer.Engine.Where("owner = ?", owner).And(fmt.Sprintf("%s = ?", quoteColumn(column)), memberName).Find(&subscriptions)
+	err = session.Where("owner = ?", owner).And(fmt.Sprintf("%s = ?", quoteColumn(column)), memberName).Find(&subscriptions)
 	if err != nil {
 		return err
 	}
@@ -92,7 +141,7 @@ func syncSubscriptionRoleMember(owner string, roleId string, column string, memb
 			continue
 		}
 
-		subRoleId, err := getPlanRoleId(sub.Owner, sub.Plan)
+		subRoleId, err := getPlanRoleIdInSession(session, sub.Owner, sub.Plan)
 		if err != nil {
 			return err
 		}
@@ -102,25 +151,14 @@ func syncSubscriptionRoleMember(owner string, roleId string, column string, memb
 		}
 	}
 
-	role, err := GetRole(roleId)
-	if err != nil || role == nil {
-		return err
-	}
-
 	memberId := util.GetId(owner, memberName)
 	members, roleColumn := role.Users, "users"
 	if column == "group" {
 		members, roleColumn = role.Groups, "groups"
 	}
-
-	if util.InSlice(members, memberId) == isActive {
+	members, changed := getSubscriptionRoleMembersAfterMutation(members, memberId, isActive)
+	if !changed {
 		return nil
-	}
-
-	if isActive {
-		members = append(members, memberId)
-	} else {
-		members = util.DeleteVal(members, memberId)
 	}
 
 	if column == "group" {
@@ -128,9 +166,30 @@ func syncSubscriptionRoleMember(owner string, roleId string, column string, memb
 	} else {
 		role.Users = members
 	}
+	if isActive {
+		if err = CheckRoleSodInSession(session, role, ""); err != nil {
+			return err
+		}
+	}
 
-	_, err = ormer.Engine.ID(core.PK{role.Owner, role.Name}).Cols(roleColumn).Update(role)
-	return err
+	affected, err := session.ID(core.PK{role.Owner, role.Name}).Cols(roleColumn).Update(role)
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("the subscription role changed while updating membership: %s", roleId)
+	}
+	return nil
+}
+
+func getSubscriptionRoleMembersAfterMutation(members []string, memberId string, isActive bool) ([]string, bool) {
+	if util.InSlice(members, memberId) == isActive {
+		return members, false
+	}
+	if isActive {
+		return append(members, memberId), true
+	}
+	return util.DeleteVal(members, memberId), true
 }
 
 func updatePaymentSubscriptions(payment *Payment) error {

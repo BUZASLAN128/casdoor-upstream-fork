@@ -108,28 +108,11 @@ func (c *ApiController) GetPlan() {
 // @router /update-plan [post]
 func (c *ApiController) UpdatePlan() {
 	id := c.Ctx.Input.Query("id")
-	owner := util.GetOwnerFromId(id)
 	var plan object.Plan
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &plan)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
-	}
-	if plan.Product != "" {
-		productId := util.GetId(owner, plan.Product)
-		product, err := object.GetProduct(productId)
-		if err != nil {
-			c.ResponseError(err.Error())
-			return
-		}
-		if product != nil {
-			object.UpdateProductForPlan(&plan, product)
-			_, err = object.UpdateProduct(productId, product)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-		}
 	}
 	c.Data["json"] = wrapActionResponse(object.UpdatePlan(id, &plan))
 	c.ServeJSON()
@@ -174,13 +157,6 @@ func (c *ApiController) DeletePlan() {
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
-	}
-	if plan.Product != "" {
-		_, err = object.DeleteProduct(&object.Product{Owner: plan.Owner, Name: plan.Product})
-		if err != nil {
-			c.ResponseError(err.Error())
-			return
-		}
 	}
 	c.Data["json"] = wrapActionResponse(object.DeletePlan(&plan))
 	c.ServeJSON()

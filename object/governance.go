@@ -22,6 +22,7 @@ import (
 
 	"github.com/casdoor/casdoor/i18n"
 	"github.com/casdoor/casdoor/util"
+	"github.com/xorm-io/xorm"
 )
 
 // SodConflict is a user holding two or more roles that a separation-of-duty rule keeps apart
@@ -36,6 +37,62 @@ type governanceUser struct {
 	Id          string
 	DisplayName string
 	Groups      []string
+}
+
+func lockGovernanceScope(session *xorm.Session, owner string) error {
+	organization := &Organization{Owner: "admin", Name: owner}
+	existed, err := session.ForUpdate().Get(organization)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return fmt.Errorf("the organization does not exist: %s", owner)
+	}
+	return nil
+}
+
+func lockGovernanceScopes(session *xorm.Session, owners ...string) error {
+	unique := map[string]bool{}
+	for _, owner := range owners {
+		if owner != "" {
+			unique[owner] = true
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for owner := range unique {
+		ordered = append(ordered, owner)
+	}
+	sort.Strings(ordered)
+	for _, owner := range ordered {
+		if err := lockGovernanceScope(session, owner); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getSodPolicy(owner string) (*EnterprisePolicy, error) {
+	organization := &Organization{}
+	existed, err := ormer.Engine.Cols("enterprise_policy").Where("owner = ? and name = ?", "admin", owner).Get(organization)
+	if err != nil {
+		return nil, err
+	}
+	if !existed {
+		return nil, fmt.Errorf("the organization does not exist: %s", owner)
+	}
+	return GetEnterprisePolicy(organization), nil
+}
+
+func getSodPolicyInSession(session *xorm.Session, owner string) (*EnterprisePolicy, error) {
+	organization := &Organization{}
+	existed, err := session.Cols("enterprise_policy").Where("owner = ? and name = ?", "admin", owner).Get(organization)
+	if err != nil {
+		return nil, err
+	}
+	if !existed {
+		return nil, fmt.Errorf("the organization does not exist: %s", owner)
+	}
+	return GetEnterprisePolicy(organization), nil
 }
 
 // getUserRoleIds lists the enabled roles of each user of the organization, given directly or through a group.
@@ -71,6 +128,67 @@ func getUserRoleIds(owner string, changedRole *Role, changedUser *User) (map[str
 			groups = changedUser.Groups
 		}
 		userMap[user.GetId()] = &governanceUser{Id: user.GetId(), DisplayName: user.DisplayName, Groups: groups}
+	}
+
+	res := map[string][]string{}
+	for _, role := range roles {
+		if !role.IsEnabled {
+			continue
+		}
+		holders := map[string]bool{}
+		for _, userId := range role.Users {
+			holders[userId] = true
+		}
+		if len(role.Groups) > 0 {
+			for _, user := range userMap {
+				for _, group := range user.Groups {
+					if util.InSlice(role.Groups, group) {
+						holders[user.Id] = true
+					}
+				}
+			}
+		}
+		for userId := range holders {
+			res[userId] = append(res[userId], role.GetId())
+		}
+	}
+	return res, userMap, nil
+}
+
+func getUserRoleIdsInSession(session *xorm.Session, owner string, replacedRoleId string, changedRole *Role, replacedUserId string, changedUser *User) (map[string][]string, map[string]*governanceUser, error) {
+	roles := []*Role{}
+	if err := session.Desc("created_time").Find(&roles, &Role{Owner: owner}); err != nil {
+		return nil, nil, err
+	}
+	if changedRole != nil {
+		replaced := false
+		for i, role := range roles {
+			if role.GetId() == replacedRoleId {
+				roles[i] = changedRole
+				replaced = true
+			}
+		}
+		if !replaced {
+			roles = append(roles, changedRole)
+		}
+	}
+
+	users := []*User{}
+	if err := session.Cols("owner", "name", "display_name", "groups").Where("owner = ?", owner).Find(&users); err != nil {
+		return nil, nil, err
+	}
+	userMap := map[string]*governanceUser{}
+	replacedUser := false
+	for _, user := range users {
+		if changedUser != nil && replacedUserId == user.GetId() {
+			userMap[changedUser.GetId()] = &governanceUser{Id: changedUser.GetId(), DisplayName: changedUser.DisplayName, Groups: changedUser.Groups}
+			replacedUser = true
+			continue
+		}
+		userMap[user.GetId()] = &governanceUser{Id: user.GetId(), DisplayName: user.DisplayName, Groups: user.Groups}
+	}
+	if changedUser != nil && !replacedUser {
+		userMap[changedUser.GetId()] = &governanceUser{Id: changedUser.GetId(), DisplayName: changedUser.DisplayName, Groups: changedUser.Groups}
 	}
 
 	res := map[string][]string{}
@@ -153,7 +271,10 @@ func CheckRoleSod(role *Role, lang string) error {
 	if role == nil {
 		return nil
 	}
-	policy := GetCachedEnterprisePolicy(role.Owner)
+	policy, err := getSodPolicy(role.Owner)
+	if err != nil {
+		return err
+	}
 	if policy == nil || len(policy.SodRules) == 0 {
 		return nil
 	}
@@ -167,6 +288,69 @@ func CheckRoleSod(role *Role, lang string) error {
 		return err
 	}
 
+	return checkRoleSodAgainstSnapshot(policy, oldRole, role, userRoleIds, userMap, lang)
+}
+
+func CheckRoleSodInSession(session *xorm.Session, role *Role, lang string) error {
+	if role == nil {
+		return nil
+	}
+	return CheckRoleSodChangeInSession(session, role.Name, role, lang)
+}
+
+func CheckRoleSodChangeInSession(session *xorm.Session, oldName string, role *Role, lang string) error {
+	if role == nil {
+		return nil
+	}
+	policy, err := getSodPolicyInSession(session, role.Owner)
+	if err != nil {
+		return err
+	}
+	if policy == nil || len(policy.SodRules) == 0 {
+		return nil
+	}
+	oldRole := &Role{Owner: role.Owner, Name: oldName}
+	existed, err := session.Get(oldRole)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		oldRole = nil
+	}
+	userRoleIds, userMap, err := getUserRoleIdsInSession(session, role.Owner, util.GetId(role.Owner, oldName), role, "", nil)
+	if err != nil {
+		return err
+	}
+	return checkRoleSodAgainstSnapshot(policy, oldRole, role, userRoleIds, userMap, lang)
+}
+
+func CheckUserSodInSession(session *xorm.Session, oldUser *User, user *User, lang string) error {
+	if user == nil || (oldUser != nil && util.StructToJson(oldUser.Groups) == util.StructToJson(user.Groups)) {
+		return nil
+	}
+	policy, err := getSodPolicyInSession(session, user.Owner)
+	if err != nil {
+		return err
+	}
+	if policy == nil || len(policy.SodRules) == 0 {
+		return nil
+	}
+	replacedUserId := ""
+	if oldUser != nil {
+		replacedUserId = oldUser.GetId()
+	}
+	userRoleIds, userMap, err := getUserRoleIdsInSession(session, user.Owner, "", nil, replacedUserId, user)
+	if err != nil {
+		return err
+	}
+	conflicts := findSodConflicts(policy, userRoleIds, userMap, map[string]bool{user.GetId(): true})
+	if len(conflicts) > 0 {
+		return formatSodConflict(conflicts[0], lang)
+	}
+	return nil
+}
+
+func checkRoleSodAgainstSnapshot(policy *EnterprisePolicy, oldRole *Role, role *Role, userRoleIds map[string][]string, userMap map[string]*governanceUser, lang string) error {
 	touched := map[string]bool{}
 	for _, userId := range role.Users {
 		if oldRole == nil || !util.InSlice(oldRole.Users, userId) || !oldRole.IsEnabled {
@@ -196,7 +380,10 @@ func CheckUserSod(oldUser *User, user *User, lang string) error {
 	if oldUser == nil || user == nil || util.StructToJson(oldUser.Groups) == util.StructToJson(user.Groups) {
 		return nil
 	}
-	policy := GetCachedEnterprisePolicy(user.Owner)
+	policy, err := getSodPolicy(user.Owner)
+	if err != nil {
+		return err
+	}
 	if policy == nil || len(policy.SodRules) == 0 {
 		return nil
 	}

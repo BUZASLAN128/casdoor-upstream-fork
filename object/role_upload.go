@@ -89,5 +89,5 @@ func UploadRoles(path string, organization string, lang string) (bool, error) {
 		return false, nil
 	}
 
-	return AddRolesInBatch(newRoles), nil
+	return AddRolesInBatch(newRoles)
 }

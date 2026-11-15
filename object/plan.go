@@ -21,6 +21,7 @@ import (
 
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 type Plan struct {
@@ -57,6 +58,19 @@ func (plan *Plan) GetRoleId() string {
 		return plan.Role
 	}
 	return util.GetId(plan.Owner, plan.Role)
+}
+
+func hasPlanUsingRoleInSession(session *xorm.Session, owner string, roleId string) (bool, error) {
+	plans := []*Plan{}
+	if err := session.Where("owner = ?", owner).Find(&plans); err != nil {
+		return false, err
+	}
+	for _, plan := range plans {
+		if plan.GetRoleId() == roleId {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func getDurationFrom(period string, startTime time.Time) (string, string, error) {
@@ -129,17 +143,65 @@ func UpdatePlan(id string, plan *Plan) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if p, err := getPlan(owner, name); err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
 		return false, err
-	} else if p == nil {
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockGovernanceScope(session, owner); err != nil {
+		return rollback(err)
+	}
+
+	oldPlan := &Plan{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(oldPlan)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
 		return false, nil
 	}
-
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(plan)
-	if err != nil {
-		return false, err
+	updated := *plan
+	updated.Owner = owner
+	updated.Name = name
+	if oldPlan.GetRoleId() != updated.GetRoleId() {
+		count, countErr := session.Where("owner = ? and plan = ?", owner, name).Count(&Subscription{})
+		if countErr != nil {
+			return rollback(countErr)
+		}
+		if count != 0 {
+			return rollback(fmt.Errorf("the plan role cannot change while subscriptions depend on it: %s", id))
+		}
+	}
+	if updated.Product != "" {
+		product := &Product{Owner: owner, Name: updated.Product}
+		productExists, productErr := session.ForUpdate().Get(product)
+		if productErr != nil {
+			return rollback(productErr)
+		}
+		if productExists {
+			UpdateProductForPlan(&updated, product)
+			if productErr = checkProduct(product); productErr != nil {
+				return rollback(productErr)
+			}
+			if _, productErr = session.ID(core.PK{product.Owner, product.Name}).AllCols().Update(product); productErr != nil {
+				return rollback(productErr)
+			}
+		}
 	}
 
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(&updated)
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*plan = updated
 	return affected != 0, nil
 }
 
@@ -152,9 +214,47 @@ func AddPlan(plan *Plan) (bool, error) {
 }
 
 func DeletePlan(plan *Plan) (bool, error) {
-	affected, err := ormer.Engine.ID(core.PK{plan.Owner, plan.Name}).Delete(Plan{})
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, plan.Owner); err != nil {
+		return rollback(err)
+	}
+
+	stored := &Plan{Owner: plan.Owner, Name: plan.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+	count, err := session.Where("owner = ? and plan = ?", plan.Owner, plan.Name).Count(&Subscription{})
+	if err != nil {
+		return rollback(err)
+	}
+	if count != 0 {
+		return rollback(fmt.Errorf("the plan cannot be deleted while subscriptions depend on it: %s", plan.GetId()))
+	}
+
+	if stored.Product != "" {
+		if _, err = session.ID(core.PK{stored.Owner, stored.Product}).Delete(&Product{}); err != nil {
+			return rollback(err)
+		}
+	}
+	affected, err := session.ID(core.PK{plan.Owner, plan.Name}).Delete(Plan{})
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
 	}
 	return affected != 0, nil
 }

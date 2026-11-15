@@ -23,6 +23,7 @@ import (
 
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 type SubscriptionState string
@@ -67,59 +68,120 @@ func (sub *Subscription) GetId() string {
 }
 
 func (sub *Subscription) UpdateState() error {
-	preState := sub.State
+	now := time.Now()
+	probe := *sub
+	probeSession := ormer.Engine.NewSession()
+	err := calculateSubscriptionStateInSession(probeSession, &probe, now)
+	probeSession.Close()
+	if err != nil {
+		return err
+	}
+	if probe.State == sub.State {
+		return nil
+	}
+	return updateSubscriptionStateAndRole(sub, now)
+}
+
+func updateSubscriptionStateAndRole(sub *Subscription, now time.Time) error {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_ = session.Rollback()
+		return err
+	}
+	if err := lockGovernanceScope(session, sub.Owner); err != nil {
+		return rollback(err)
+	}
+
+	stored := &Subscription{Owner: sub.Owner, Name: sub.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		return rollback(fmt.Errorf("the subscription does not exist: %s", sub.GetId()))
+	}
+	candidate := *stored
+	preState := candidate.State
+	if err = calculateSubscriptionStateInSession(session, &candidate, now); err != nil {
+		return rollback(err)
+	}
+	if preState == candidate.State {
+		_ = session.Rollback()
+		sub.State = candidate.State
+		sub.Description = candidate.Description
+		return nil
+	}
+
+	stored.State = candidate.State
+	stored.Description = candidate.Description
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Cols("state", "description").Update(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if affected != 1 {
+		return rollback(fmt.Errorf("the subscription state was not updated: %s", candidate.GetId()))
+	}
+	if err = syncSubscriptionRoleInSession(session, stored); err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	sub.State = candidate.State
+	sub.Description = candidate.Description
+	return nil
+}
+
+func calculateSubscriptionStateInSession(session *xorm.Session, candidate *Subscription, now time.Time) error {
 	// update subscription state by payment state
-	if sub.State == SubStatePending {
-		if sub.Payment == "" {
+	if candidate.State == SubStatePending {
+		if candidate.Payment == "" {
 			return nil
 		}
-		payment, err := GetPayment(util.GetId(sub.Owner, sub.Payment))
+		paymentOwner, paymentName, err := util.GetOwnerAndNameFromIdWithError(util.GetId(candidate.Owner, candidate.Payment))
 		if err != nil {
 			return err
 		}
-		if payment == nil {
-			sub.Description = fmt.Sprintf("payment: %s does not exist", sub.Payment)
-			sub.State = SubStateError
+		payment := &Payment{Owner: paymentOwner, Name: paymentName}
+		existed, err := session.Get(payment)
+		if err != nil {
+			return err
+		}
+		if !existed {
+			candidate.Description = fmt.Sprintf("payment: %s does not exist", candidate.Payment)
+			candidate.State = SubStateError
 		} else {
 			if payment.State == pp.PaymentStatePaid {
-				sub.State = SubStateActive
+				candidate.State = SubStateActive
 			} else if payment.State != pp.PaymentStateCreated {
 				// other states: Canceled, Timeout, Error
-				sub.Description = fmt.Sprintf("payment: %s state is %v", sub.Payment, payment.State)
-				sub.State = SubStateError
+				candidate.Description = fmt.Sprintf("payment: %s state is %v", candidate.Payment, payment.State)
+				candidate.State = SubStateError
 			}
 		}
 	}
 
-	if sub.State == SubStateActive || sub.State == SubStateUpcoming || sub.State == SubStateExpired {
-		startTime, err := time.Parse(time.RFC3339, sub.StartTime)
+	if candidate.State == SubStateActive || candidate.State == SubStateUpcoming || candidate.State == SubStateExpired {
+		startTime, err := time.Parse(time.RFC3339, candidate.StartTime)
 		if err != nil {
 			return err
 		}
 
-		endTime, err := time.Parse(time.RFC3339, sub.EndTime)
+		endTime, err := time.Parse(time.RFC3339, candidate.EndTime)
 		if err != nil {
 			return err
 		}
 
-		if endTime.Before(time.Now()) {
-			sub.State = SubStateExpired
-		} else if startTime.After(time.Now()) {
-			sub.State = SubStateUpcoming
+		if endTime.Before(now) {
+			candidate.State = SubStateExpired
+		} else if startTime.After(now) {
+			candidate.State = SubStateUpcoming
 		} else {
-			sub.State = SubStateActive
-		}
-	}
-
-	if preState != sub.State {
-		_, err := ormer.Engine.ID(core.PK{sub.Owner, sub.Name}).Cols("state", "description").Update(sub)
-		if err != nil {
-			return err
-		}
-
-		err = syncSubscriptionRole(sub)
-		if err != nil {
-			return err
+			candidate.State = SubStateActive
 		}
 	}
 
@@ -402,73 +464,131 @@ func UpdateSubscription(id string, subscription *Subscription) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	oldSubscription, err := getSubscription(owner, name)
+	preUpdate, err := getSubscription(owner, name)
 	if err != nil {
 		return false, err
-	} else if oldSubscription == nil {
+	}
+	if preUpdate == nil {
 		return false, nil
 	}
-
-	if subscription.AutoRenew && !oldSubscription.AutoRenew {
-		err = checkSubscriptionAutoRenew(subscription)
-		if err != nil {
+	updated := *subscription
+	updated.Owner = owner
+	updated.Name = name
+	if updated.AutoRenew && !preUpdate.AutoRenew {
+		if err = checkSubscriptionAutoRenew(&updated); err != nil {
 			return false, err
 		}
 	}
 
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Omit("renewal_state", "renewal_subscription", "renewal_message").Update(subscription)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
 		return false, err
 	}
-
-	if affected != 0 {
-		err = syncSubscriptionRole(oldSubscription)
-		if err != nil {
-			return false, err
-		}
-
-		err = syncSubscriptionRole(subscription)
-		if err != nil {
-			return false, err
-		}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockGovernanceScope(session, owner); err != nil {
+		return rollback(err)
 	}
 
+	oldSubscription := &Subscription{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(oldSubscription)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+	if oldSubscription.AutoRenew != preUpdate.AutoRenew {
+		return rollback(fmt.Errorf("the subscription changed concurrently: %s", id))
+	}
+
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Omit("renewal_state", "renewal_subscription", "renewal_message").Update(&updated)
+	if err != nil {
+		return rollback(err)
+	}
+	if affected != 0 {
+		if err = syncSubscriptionRoleInSession(session, oldSubscription); err != nil {
+			return rollback(err)
+		}
+		if err = syncSubscriptionRoleInSession(session, &updated); err != nil {
+			return rollback(err)
+		}
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*subscription = updated
 	return affected != 0, nil
 }
 
 func AddSubscription(subscription *Subscription) (bool, error) {
-	affected, err := ormer.Engine.Insert(subscription)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
 	}
-
-	if affected != 0 {
-		err = syncSubscriptionRole(subscription)
-		if err != nil {
-			return false, err
-		}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, subscription.Owner); err != nil {
+		return rollback(err)
 	}
 
+	affected, err := session.Insert(subscription)
+	if err != nil {
+		return rollback(err)
+	}
+	if affected != 0 {
+		if err = syncSubscriptionRoleInSession(session, subscription); err != nil {
+			return rollback(err)
+		}
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
 	return affected != 0, nil
 }
 
 func DeleteSubscription(subscription *Subscription) (bool, error) {
-	oldSubscription, err := getSubscription(subscription.Owner, subscription.Name)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
 	}
-
-	affected, err := ormer.Engine.ID(core.PK{subscription.Owner, subscription.Name}).Delete(&Subscription{})
-	if err != nil {
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
 		return false, err
 	}
+	if err := lockGovernanceScope(session, subscription.Owner); err != nil {
+		return rollback(err)
+	}
 
+	oldSubscription := &Subscription{Owner: subscription.Owner, Name: subscription.Name}
+	existed, err := session.ForUpdate().Get(oldSubscription)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+
+	affected, err := session.ID(core.PK{subscription.Owner, subscription.Name}).Delete(&Subscription{})
+	if err != nil {
+		return rollback(err)
+	}
 	if affected != 0 {
-		err = syncSubscriptionRole(oldSubscription)
-		if err != nil {
-			return false, err
+		if err = syncSubscriptionRoleInSession(session, oldSubscription); err != nil {
+			return rollback(err)
 		}
 	}
-
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
 	return affected != 0, nil
 }
