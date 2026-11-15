@@ -60,6 +60,33 @@ func TestCerberusSecurityPermissionDependenciesBlockIdentityReuse(t *testing.T) 
 	}
 }
 
+func TestCerberusSecurityBootstrapUserGroupStagingFailsClosed(t *testing.T) {
+	engine := newGovernanceLifecycleEngine(t)
+	previousUserEnforcer := userEnforcer
+	userEnforcer = nil
+	t.Cleanup(func() {
+		userEnforcer = previousUserEnforcer
+	})
+
+	session := engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		t.Fatalf("begin bootstrap group staging: %v", err)
+	}
+	defer session.Rollback()
+
+	staged, err := stageNewUserGroups(session, &User{Owner: "built-in", Name: "admin"})
+	if err != nil || staged {
+		t.Fatalf("empty bootstrap user groups = (%v, %v), want (false, nil)", staged, err)
+	}
+	if staged, err = stageNewUserGroups(session, &User{Owner: "built-in", Name: "admin", Groups: []string{"built-in/operators"}}); err == nil || staged {
+		t.Fatalf("grouped bootstrap user = (%v, %v), want fail closed", staged, err)
+	}
+	if staged, err = stageNewUserGroups(session, &User{Owner: "tenant", Name: "user"}); err == nil || staged {
+		t.Fatalf("ordinary pre-enforcer user = (%v, %v), want fail closed", staged, err)
+	}
+}
+
 func TestCerberusSecurityPermissionPoliciesFollowCallerTransaction(t *testing.T) {
 	engine := newGovernanceLifecycleEngine(t)
 	seedGovernanceLifecycleOwner(t, engine)

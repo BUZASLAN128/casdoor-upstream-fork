@@ -16,6 +16,25 @@ type UserGroupEnforcer struct {
 	enforcer *casbin.SyncedEnforcer
 }
 
+// stageNewUserGroups persists a new user's group bindings when the user-group
+// manager is available. During a first-ever database bootstrap the exact
+// built-in/admin user is created before the built-in user model, adapter and
+// enforcer records exist. That bootstrap user has no groups, so there is no
+// policy to persist. Every other pre-enforcer add fails closed.
+func stageNewUserGroups(session *xorm.Session, user *User) (bool, error) {
+	if userEnforcer == nil || userEnforcer.enforcer == nil {
+		if user.Owner == "built-in" && user.Name == "admin" && len(user.Groups) == 0 {
+			return false, nil
+		}
+		return false, fmt.Errorf("the user-group enforcer is not initialized")
+	}
+
+	if err := userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // replaceGroupsForUserInSession persists the canonical user-group bindings in
 // the caller's transaction. The built-in user enforcer is deliberately backed
 // by Casdoor's own database, so its policy rows and the User.Groups column can

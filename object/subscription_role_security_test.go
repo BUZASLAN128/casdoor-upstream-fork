@@ -315,7 +315,7 @@ func TestCerberusSecurityUserGroupPersistenceIsTransactional(t *testing.T) {
 	if !strings.Contains(allFields, "updateUserAllFieldsGroupsWithGovernance(") {
 		t.Fatal("all-fields updates must revalidate groups under the governance lock")
 	}
-	for _, functionName := range []string{"updateUserGroupsWithGovernance", "updateUserAllFieldsGroupsWithGovernance", "AddUser", "AddUsers"} {
+	for _, functionName := range []string{"updateUserGroupsWithGovernance", "updateUserAllFieldsGroupsWithGovernance", "AddUsers"} {
 		body := subscriptionFunctionSource(t, userSource, functionName)
 		persistPos := strings.Index(body, "replaceGroupsForUserInSession(")
 		commitPos := strings.Index(body, "session.Commit()")
@@ -326,6 +326,26 @@ func TestCerberusSecurityUserGroupPersistenceIsTransactional(t *testing.T) {
 		if strings.Contains(body, "UpdateGroupsForUser(") {
 			t.Fatalf("%s must not persist bindings through an independent adapter transaction", functionName)
 		}
+	}
+	addUserBody := subscriptionFunctionSource(t, userSource, "AddUser")
+	stagePos := strings.Index(addUserBody, "stageNewUserGroups(")
+	commitPos := strings.Index(addUserBody, "session.Commit()")
+	publishPos := strings.Index(addUserBody, "publishCommittedGroups()")
+	if stagePos < 0 || commitPos < 0 || publishPos < 0 || stagePos > commitPos || commitPos > publishPos {
+		t.Fatal("AddUser must stage bindings in its transaction and publish only after commit")
+	}
+	if strings.Contains(addUserBody, "UpdateGroupsForUser(") {
+		t.Fatal("AddUser must not persist bindings through an independent adapter transaction")
+	}
+	userEnforcerBytes, err := os.ReadFile("user_enforcer.go")
+	if err != nil {
+		t.Fatalf("read user_enforcer.go: %v", err)
+	}
+	stageBody := subscriptionFunctionSource(t, string(userEnforcerBytes), "stageNewUserGroups")
+	if !strings.Contains(stageBody, "replaceGroupsForUserInSession(") ||
+		!strings.Contains(stageBody, `user.Owner == "built-in" && user.Name == "admin" && len(user.Groups) == 0`) ||
+		!strings.Contains(stageBody, "the user-group enforcer is not initialized") {
+		t.Fatal("new-user group staging must fail closed except for the empty first-start built-in/admin bootstrap")
 	}
 }
 

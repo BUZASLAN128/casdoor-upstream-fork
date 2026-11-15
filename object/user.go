@@ -1386,14 +1386,17 @@ func AddUser(user *User, lang string) (bool, error) {
 	if err != nil {
 		return rollback(err)
 	}
-	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
+	groupsStaged, err := stageNewUserGroups(session, user)
+	if err != nil {
 		return rollback(err)
 	}
 	if err = session.Commit(); err != nil {
 		return rollback(err)
 	}
-	if err = userEnforcer.publishCommittedGroups(); err != nil {
-		return false, err
+	if groupsStaged {
+		if err = userEnforcer.publishCommittedGroups(); err != nil {
+			return false, err
+		}
 	}
 
 	return affected != 0, nil
