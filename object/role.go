@@ -147,17 +147,24 @@ func UpdateRole(id string, role *Role, isGlobalAdmin bool, lang string) (bool, e
 		if usedByPam {
 			return rollback(fmt.Errorf("the role cannot be renamed while privileged access depends on it: %s", id))
 		}
+		usedByPermission, checkErr := hasPermissionUsingRoleInSession(session, oldRole.GetId())
+		if checkErr != nil {
+			return rollback(checkErr)
+		}
+		if usedByPermission {
+			return rollback(fmt.Errorf("the role cannot be renamed while a permission depends on it: %s", id))
+		}
 		updated.Roles = util.ReplaceVal(updated.Roles, util.GetId(owner, name), util.GetId(owner, updated.Name))
 	}
 	if err = CheckRoleSodChangeInSession(session, name, &updated, lang); err != nil {
 		return rollback(err)
 	}
+	if err = validateRoleReferencesInSession(session, &updated); err != nil {
+		return rollback(err)
+	}
 
-	oldPermissions := []*Permission{}
-	newPermissions := []*Permission{}
 	if renameRole {
-		oldPermissions, newPermissions, err = roleChangeReferencesInSession(session, owner, name, updated.Name)
-		if err != nil {
+		if err = roleChangeReferencesInSession(session, owner, name, updated.Name); err != nil {
 			return rollback(err)
 		}
 	}
@@ -170,19 +177,6 @@ func UpdateRole(id string, role *Role, isGlobalAdmin bool, lang string) (bool, e
 		return rollback(err)
 	}
 	*role = updated
-
-	if renameRole && affected != 0 {
-		for _, permission := range oldPermissions {
-			if err = removePolicies(permission); err != nil {
-				return true, fmt.Errorf("the role was renamed but removing its old permission policy failed: %w", err)
-			}
-		}
-		for _, permission := range newPermissions {
-			if err = addPolicies(permission); err != nil {
-				return true, fmt.Errorf("the role was renamed but adding its new permission policy failed: %w", err)
-			}
-		}
-	}
 
 	return affected != 0, nil
 }
@@ -198,6 +192,9 @@ func AddRole(role *Role) (bool, error) {
 		return false, err
 	}
 	if err := lockGovernanceScope(session, role.Owner); err != nil {
+		return rollback(err)
+	}
+	if err := validateRoleReferencesInSession(session, role); err != nil {
 		return rollback(err)
 	}
 	if err := CheckRoleSodInSession(session, role, ""); err != nil {
@@ -239,7 +236,15 @@ func AddRoles(roles []*Role) (bool, error) {
 		}
 	}
 	affected := int64(0)
+	batchRoleIds := map[string]bool{}
 	for _, role := range roles {
+		batchRoleIds[role.GetId()] = true
+	}
+	for _, role := range roles {
+		if err := validateRoleReferencesWithKnownInSession(session, role, batchRoleIds); err != nil {
+			_ = session.Rollback()
+			return false, err
+		}
 		if err := CheckRoleSodInSession(session, role, ""); err != nil {
 			_ = session.Rollback()
 			return false, err
@@ -336,18 +341,19 @@ func DeleteRole(role *Role) (bool, error) {
 	if usedByPam {
 		return rollback(fmt.Errorf("the role cannot be deleted while privileged access depends on it: %s", roleId))
 	}
-
-	permissions, err := GetPermissionsByRole(roleId)
+	usedByPermission, err := hasPermissionUsingRoleInSession(session, roleId)
 	if err != nil {
 		return rollback(err)
 	}
-
-	for _, permission := range permissions {
-		permission.Roles = util.DeleteVal(permission.Roles, roleId)
-		_, err := UpdatePermission(permission.GetId(), permission)
-		if err != nil {
-			return rollback(err)
-		}
+	if usedByPermission {
+		return rollback(fmt.Errorf("the role cannot be deleted while a permission depends on it: %s", roleId))
+	}
+	usedByRole, err := hasRoleUsingRoleInSession(session, roleId)
+	if err != nil {
+		return rollback(err)
+	}
+	if usedByRole {
+		return rollback(fmt.Errorf("the role cannot be deleted while another role depends on it: %s", roleId))
 	}
 
 	affected, err := session.ID(core.PK{role.Owner, role.Name}).Delete(&Role{})
@@ -373,6 +379,59 @@ func hasPamRoleDependencyInSession(session *xorm.Session, owner string, roleName
 		return false, err
 	}
 	return requestCount != 0, nil
+}
+
+func hasPermissionUsingRoleInSession(session *xorm.Session, roleId string) (bool, error) {
+	permissions := []*Permission{}
+	if err := session.Cols("roles").Find(&permissions); err != nil {
+		return false, err
+	}
+	for _, permission := range permissions {
+		if util.InSlice(permission.Roles, roleId) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func hasRoleUsingRoleInSession(session *xorm.Session, roleId string) (bool, error) {
+	roles := []*Role{}
+	if err := session.Cols("owner", "name", "roles").Find(&roles); err != nil {
+		return false, err
+	}
+	for _, role := range roles {
+		if role.GetId() != roleId && util.InSlice(role.Roles, roleId) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func validateRoleReferencesInSession(session *xorm.Session, role *Role) error {
+	return validateRoleReferencesWithKnownInSession(session, role, nil)
+}
+
+func validateRoleReferencesWithKnownInSession(session *xorm.Session, role *Role, knownRoleIds map[string]bool) error {
+	for _, nestedRoleId := range role.Roles {
+		nestedOwner, nestedName, err := util.GetOwnerAndNameFromIdWithError(nestedRoleId)
+		if err != nil {
+			return err
+		}
+		if nestedOwner != role.Owner {
+			return fmt.Errorf("the nested role is outside its organization: %s", nestedRoleId)
+		}
+		if nestedRoleId == role.GetId() || knownRoleIds[nestedRoleId] {
+			continue
+		}
+		existed, err := session.ID(core.PK{nestedOwner, nestedName}).Exist(&Role{})
+		if err != nil {
+			return err
+		}
+		if !existed {
+			return fmt.Errorf("the nested role does not exist: %s", nestedRoleId)
+		}
+	}
+	return nil
 }
 
 func (role *Role) GetId() string {
@@ -533,52 +592,29 @@ func roleChangeTrigger(owner string, oldName string, newName string) error {
 	return err
 }
 
-func roleChangeReferencesInSession(session *xorm.Session, owner string, oldName string, newName string) ([]*Permission, []*Permission, error) {
+func roleChangeReferencesInSession(session *xorm.Session, owner string, oldName string, newName string) error {
 	oldRoleId := util.GetId(owner, oldName)
 	newRoleId := util.GetId(owner, newName)
 	var roles []*Role
 	if err := session.Find(&roles); err != nil {
-		return nil, nil, err
+		return err
 	}
 	for _, role := range roles {
 		if !util.InSlice(role.Roles, oldRoleId) {
 			continue
 		}
 		if role.Owner != owner {
-			return nil, nil, fmt.Errorf("the role cannot be renamed while another organization depends on it: %s", role.GetId())
+			return fmt.Errorf("the role cannot be renamed while another organization depends on it: %s", role.GetId())
 		}
 		if role.Name == oldName {
 			continue
 		}
 		role.Roles = util.ReplaceVal(role.Roles, oldRoleId, newRoleId)
 		if _, err := session.ID(core.PK{role.Owner, role.Name}).Cols("roles").Update(role); err != nil {
-			return nil, nil, err
+			return err
 		}
 	}
-
-	var permissions []*Permission
-	if err := session.Find(&permissions); err != nil {
-		return nil, nil, err
-	}
-	oldPermissions := []*Permission{}
-	newPermissions := []*Permission{}
-	for _, permission := range permissions {
-		if !util.InSlice(permission.Roles, oldRoleId) {
-			continue
-		}
-		if permission.Owner != owner {
-			return nil, nil, fmt.Errorf("the role cannot be renamed while another organization's permission depends on it: %s", permission.GetId())
-		}
-		oldPermission := *permission
-		oldPermission.Roles = append([]string{}, permission.Roles...)
-		permission.Roles = util.ReplaceVal(permission.Roles, oldRoleId, newRoleId)
-		if _, err := session.ID(core.PK{permission.Owner, permission.Name}).Cols("roles").Update(permission); err != nil {
-			return nil, nil, err
-		}
-		oldPermissions = append(oldPermissions, &oldPermission)
-		newPermissions = append(newPermissions, permission)
-	}
-	return oldPermissions, newPermissions, nil
+	return nil
 }
 
 func GetMaskedRoles(roles []*Role) []*Role {

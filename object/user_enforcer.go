@@ -44,6 +44,16 @@ func (e *UserGroupEnforcer) replaceGroupsForUserInSession(session *xorm.Session,
 	return nil
 }
 
+func (e *UserGroupEnforcer) deleteGroupsForUserInSession(session *xorm.Session, user string) error {
+	adapter, ok := e.enforcer.GetAdapter().(*SafeAdapter)
+	if !ok || adapter == nil || !adapter.sameDatabase {
+		return fmt.Errorf("the user-group adapter is not backed by Casdoor's database")
+	}
+	_, err := session.Where("ptype = ? AND v0 = ?", "g", user).
+		Delete(&safeCasbinRule{tableName: adapter.policyTableName()})
+	return err
+}
+
 func (e *UserGroupEnforcer) deleteGroupBindingsInSession(session *xorm.Session, group string) error {
 	adapter, ok := e.enforcer.GetAdapter().(*SafeAdapter)
 	if !ok || adapter == nil || !adapter.sameDatabase {

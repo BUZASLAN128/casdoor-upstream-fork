@@ -105,6 +105,9 @@ func UpdateAdapter(id string, adapter *Adapter) (bool, error) {
 	if adapter, err := getAdapter(owner, name); adapter == nil {
 		return false, err
 	}
+	if err = ensurePermissionPolicyTableForAdapter(ormer.Engine, adapter); err != nil {
+		return false, err
+	}
 
 	if name != adapter.Name {
 		err := adapterChangeTrigger(owner, name, adapter.Name)
@@ -112,7 +115,6 @@ func UpdateAdapter(id string, adapter *Adapter) (bool, error) {
 			return false, err
 		}
 	}
-
 	session := ormer.Engine.ID(core.PK{owner, name}).AllCols()
 	if adapter.Password == "***" {
 		session.Omit("password")
@@ -126,6 +128,9 @@ func UpdateAdapter(id string, adapter *Adapter) (bool, error) {
 }
 
 func AddAdapter(adapter *Adapter) (bool, error) {
+	if err := ensurePermissionPolicyTableForAdapter(ormer.Engine, adapter); err != nil {
+		return false, err
+	}
 	affected, err := ormer.Engine.Insert(adapter)
 	if err != nil {
 		return false, err

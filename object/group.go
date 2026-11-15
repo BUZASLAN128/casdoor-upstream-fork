@@ -245,6 +245,14 @@ func updateGroupWithGovernance(owner string, name string, group *Group) (bool, e
 		if targetExists {
 			return rollback(fmt.Errorf("the target group already exists: %s", target.GetId()))
 		}
+		groupId := util.GetId(owner, name)
+		usedByPermission, dependencyErr := hasPermissionUsingGroupInSession(session, groupId)
+		if dependencyErr != nil {
+			return rollback(dependencyErr)
+		}
+		if usedByPermission {
+			return rollback(fmt.Errorf("the group cannot be renamed while a permission depends on it: %s", groupId))
+		}
 		if err = groupChangeInSession(session, owner, name, updated.Name); err != nil {
 			return rollback(err)
 		}
@@ -263,7 +271,7 @@ func updateGroupWithGovernance(owner string, name string, group *Group) (bool, e
 	*group = updated
 	if rename {
 		if err = userEnforcer.publishCommittedGroups(); err != nil {
-			return false, err
+			return true, fmt.Errorf("the group was renamed but publishing its committed memberships failed: %w", err)
 		}
 	}
 	return true, nil
@@ -433,6 +441,13 @@ func DeleteGroup(group *Group) (bool, error) {
 			return rollback(fmt.Errorf("the group cannot be deleted while a role depends on it: %s", groupId))
 		}
 	}
+	usedByPermission, err := hasPermissionUsingGroupInSession(session, groupId)
+	if err != nil {
+		return rollback(err)
+	}
+	if usedByPermission {
+		return rollback(fmt.Errorf("the group cannot be deleted while a permission depends on it: %s", groupId))
+	}
 	count, err := session.Where("owner = ?", group.Owner).And(fmt.Sprintf("%s = ?", quoteColumn("group")), group.Name).Count(&Subscription{})
 	if err != nil {
 		return rollback(err)
@@ -449,6 +464,19 @@ func DeleteGroup(group *Group) (bool, error) {
 		return rollback(err)
 	}
 	return affected != 0, nil
+}
+
+func hasPermissionUsingGroupInSession(session *xorm.Session, groupId string) (bool, error) {
+	permissions := []*Permission{}
+	if err := session.Cols("groups").Find(&permissions); err != nil {
+		return false, err
+	}
+	for _, permission := range permissions {
+		if util.InSlice(permission.Groups, groupId) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func checkGroupName(name string) error {

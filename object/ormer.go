@@ -538,6 +538,16 @@ func (a *Ormer) createTable() {
 		panic(err)
 	}
 
+	permissionPolicyTable := conf.GetConfigString("tableNamePrefix") + "permission_rule"
+	err = ensurePermissionPolicyTable(a.Engine, permissionPolicyTable)
+	if err != nil {
+		panic(err)
+	}
+	err = ensureStoredPermissionPolicyTables(a.Engine)
+	if err != nil {
+		panic(err)
+	}
+
 	err = a.Engine.Sync2(new(Form))
 	if err != nil {
 		panic(err)

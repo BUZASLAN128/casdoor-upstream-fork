@@ -132,14 +132,6 @@ func (c *ApiController) AddPlan() {
 		c.ResponseError(err.Error())
 		return
 	}
-	// Create a related product for plan
-	product := object.CreateProductForPlan(&plan)
-	_, err = object.AddProduct(product)
-	if err != nil {
-		c.ResponseError(err.Error())
-		return
-	}
-	plan.Product = product.Name
 	c.Data["json"] = wrapActionResponse(object.AddPlan(&plan))
 	c.ServeJSON()
 }

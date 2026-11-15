@@ -98,6 +98,40 @@ func TestSafeAdapterSavePolicyReplacesRulesWithoutDroppingTable(t *testing.T) {
 		t.Fatalf("len(rules) after remove = %d, want 1", len(rules))
 	}
 
+	err = safeAdapter.AddPolicies("p", "p", [][]string{
+		{"new", "subject", "POST", "/api/new", "tenant", "marker"},
+		{"new2", "subject", "POST", "/api/other", "tenant", "marker2"},
+	})
+	if err != nil {
+		t.Fatalf("AddPolicies() error = %v", err)
+	}
+	loaded := newPolicyModel(t, nil)
+	err = safeAdapter.LoadFilteredPolicy(loaded, xormadapter.Filter{Ptype: []string{"p"}, V5: []string{"marker"}})
+	if err != nil {
+		t.Fatalf("LoadFilteredPolicy() error = %v", err)
+	}
+	if !safeAdapter.IsFiltered() {
+		t.Fatal("LoadFilteredPolicy() did not mark the adapter filtered")
+	}
+	if policies := loaded["p"]["p"].Policy; len(policies) != 1 || policies[0][0] != "new" {
+		t.Fatalf("filtered policies = %v, want the marker policy", policies)
+	}
+	filterSession := engine.NewSession()
+	filteredCount, countErr := safeRuleFilterQuery(filterSession, xormadapter.Filter{Ptype: []string{"p"}, V5: []string{"marker"}}).
+		Table(&safeCasbinRule{tableName: tableName}).Count(&safeCasbinRule{})
+	filterSession.Close()
+	if countErr != nil || filteredCount != 1 {
+		t.Fatalf("SQL-filtered policy count = (%d, %v), want one", filteredCount, countErr)
+	}
+	if err = safeAdapter.RemoveFilteredPolicy("p", "p", 5, "marker"); err != nil {
+		t.Fatalf("RemoveFilteredPolicy() error = %v", err)
+	}
+	rules = getSafeAdapterRules(t, safeAdapter)
+	if len(rules) != 2 {
+		t.Fatalf("len(rules) after filtered remove = %d, want 2", len(rules))
+	}
+	assertPolicyExists(t, rules, []string{"new2", "subject", "POST", "/api/other", "tenant", "marker2"})
+
 	var markerIndexCount int64
 	markerIndexCount, err = engine.SQL("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name = ?", tableName, "casbin_api_rule_marker_idx").Count()
 	if err != nil {

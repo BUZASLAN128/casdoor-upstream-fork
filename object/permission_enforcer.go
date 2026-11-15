@@ -22,7 +22,6 @@ import (
 	"github.com/casbin/casbin/v2/config"
 	"github.com/casbin/casbin/v2/log"
 	"github.com/casbin/casbin/v2/model"
-	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
 	xormadapter "github.com/casdoor/xorm-adapter/v3"
 )
@@ -72,27 +71,21 @@ func getPermissionEnforcer(p *Permission, permissionIDs ...string) (*casbin.Enfo
 }
 
 func (p *Permission) setEnforcerAdapter(enforcer *casbin.Enforcer) error {
-	tableName := "permission_rule"
-	if len(p.Adapter) != 0 {
-		adapterObj, err := getAdapter(p.Owner, p.Adapter)
-		if err != nil {
-			return err
-		}
-
-		if adapterObj != nil && adapterObj.Table != "" {
-			if !adapterObj.UseSameDb && adapterObj.Owner != "built-in" {
-				return fmt.Errorf("the adapter: %s of permission: %s must use the same DB as Casdoor", adapterObj.GetId(), p.GetId())
-			}
-			tableName = adapterObj.Table
-		}
-	}
-	tableNamePrefix := conf.GetConfigString("tableNamePrefix")
-	adapter, err := xormadapter.NewAdapterByEngineWithTableName(ormer.Engine, tableName, tableNamePrefix)
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	tableName, err := resolvePermissionPolicyTableName(session, p, false)
 	if err != nil {
 		return err
 	}
 
-	enforcer.SetAdapter(adapter)
+	// Schema creation belongs to startup. Constructing the upstream xorm adapter
+	// here runs Sync2 on every permission check, which can attempt a duplicate
+	// BIGSERIAL column on CockroachDB and lets a request mutate database schema.
+	enforcer.SetAdapter(&SafeAdapter{
+		engine:       ormer.Engine,
+		tableName:    tableName,
+		sameDatabase: true,
+	})
 	return nil
 }
 

@@ -698,7 +698,7 @@ func initDefinedPermission(permission *Permission, raw json.RawMessage) {
 			})
 			return
 		}
-		affected, err := deletePermission(permission)
+		affected, err := DeletePermission(permission)
 		if err != nil {
 			panic(err)
 		}

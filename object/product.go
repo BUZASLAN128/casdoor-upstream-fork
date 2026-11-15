@@ -132,26 +132,56 @@ func UpdateProductStock(productInfos []ProductInfo) error {
 }
 
 func UpdateProduct(id string, product *Product) (bool, error) {
+	if product == nil {
+		return false, fmt.Errorf("the product does not exist")
+	}
 	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		return false, err
 	}
-	if p, err := getProduct(owner, name); err != nil {
+	updated := *product
+	updated.Owner = owner
+	updated.Name = name
+	err = checkProduct(&updated)
+	if err != nil {
 		return false, err
-	} else if p == nil {
+	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockGovernanceScope(session, owner); err != nil {
+		return rollback(err)
+	}
+	stored := &Product{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
 		return false, nil
 	}
-
-	err = checkProduct(product)
+	usedByPlan, err := hasPlanUsingProductInSession(session, owner, name, "")
 	if err != nil {
-		return false, err
+		return rollback(err)
 	}
-
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(product)
+	if usedByPlan {
+		return rollback(fmt.Errorf("the product cannot be updated directly while a plan depends on it: %s", id))
+	}
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(&updated)
 	if err != nil {
-		return false, err
+		return rollback(err)
 	}
-
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*product = updated
 	return affected != 0, nil
 }
 
@@ -211,11 +241,35 @@ func checkProduct(product *Product) error {
 }
 
 func DeleteProduct(product *Product) (bool, error) {
-	affected, err := ormer.Engine.ID(core.PK{product.Owner, product.Name}).Delete(&Product{})
-	if err != nil {
+	if product == nil {
+		return false, fmt.Errorf("the product does not exist")
+	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
 	}
-
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, product.Owner); err != nil {
+		return rollback(err)
+	}
+	usedByPlan, err := hasPlanUsingProductInSession(session, product.Owner, product.Name, "")
+	if err != nil {
+		return rollback(err)
+	}
+	if usedByPlan {
+		return rollback(fmt.Errorf("the product cannot be deleted while a plan depends on it: %s", product.GetId()))
+	}
+	affected, err := session.ID(core.PK{product.Owner, product.Name}).Delete(&Product{})
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
 	return affected != 0, nil
 }
 
@@ -310,7 +364,7 @@ func CreateProductForPlan(plan *Plan) *Product {
 		Image:       "https://cdn.casbin.org/img/casdoor-logo_1185x256.png", // TODO
 		Detail:      fmt.Sprintf("This product was auto created for plan %v(%v), subscription period is %v", plan.Name, plan.DisplayName, plan.Period),
 		Description: plan.Description,
-		Tag:         "auto_created_product_for_plan",
+		Tag:         planManagedProductTag,
 		Price:       plan.Price,
 		Currency:    plan.Currency,
 
@@ -320,6 +374,9 @@ func CreateProductForPlan(plan *Plan) *Product {
 
 		Providers: plan.PaymentProviders,
 		State:     "Published",
+		Properties: map[string]string{
+			planManagedProductProperty: plan.GetId(),
+		},
 	}
 	if product.Providers == nil {
 		product.Providers = []string{}

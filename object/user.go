@@ -949,6 +949,9 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	if oldUser == nil {
 		return false, fmt.Errorf("the user: %s is not found", id)
 	}
+	if user.Owner != owner {
+		return false, fmt.Errorf("moving a user between organizations is not supported: %s -> %s", owner, user.Owner)
+	}
 
 	// Auto-upgrade guest users when they update their username or password
 	if oldUser.Tag == "guest-user" {
@@ -964,13 +967,6 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 			if !util.InSlice(columns, "tag") && len(columns) > 0 {
 				columns = append(columns, "tag")
 			}
-		}
-	}
-
-	if name != user.Name {
-		err := userChangeTrigger(owner, name, user.Name)
-		if err != nil {
-			return false, err
 		}
 	}
 
@@ -1003,6 +999,10 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	if len(columns) == 0 {
 		columns = GetDefaultUserUpdateColumns(isAdmin)
 	}
+	rename := name != user.Name && util.InSlice(columns, "name")
+	if name != user.Name && !rename {
+		user.Name = name
+	}
 
 	columns = append(columns, "updated_time")
 	user.UpdatedTime = util.GetCurrentTime()
@@ -1012,13 +1012,17 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	}
 
 	var affected int64
-	if util.InSlice(columns, "groups") {
+	if rename || util.InSlice(columns, "groups") {
 		affected, err = updateUserGroupsWithGovernance(id, user, columns)
 	} else {
 		affected, err = updateUser(id, user, columns)
 	}
+	var publicationErr error
 	if err != nil {
-		return false, err
+		if affected == 0 {
+			return false, err
+		}
+		publicationErr = err
 	}
 
 	if affected != 0 {
@@ -1029,8 +1033,15 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 		// The tokens and sessions are keyed by the old user name, it may have just been renamed
 		err = TerminateUserAccess(oldUser)
 		if err != nil {
-			return true, fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+			terminationErr := fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+			if publicationErr != nil {
+				return true, errors.Join(publicationErr, terminationErr)
+			}
+			return true, terminationErr
 		}
+	}
+	if publicationErr != nil {
+		return true, fmt.Errorf("the user: %s is updated, but publishing its committed group policy failed: %w", id, publicationErr)
 	}
 
 	return affected != 0, nil
@@ -1038,6 +1049,9 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 
 func updateUserGroupsWithGovernance(id string, user *User, columns []string) (int64, error) {
 	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
+	if user.Owner != owner {
+		return 0, fmt.Errorf("moving a user between organizations is not supported: %s -> %s", owner, user.Owner)
+	}
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 	if err := session.Begin(); err != nil {
@@ -1058,6 +1072,15 @@ func updateUserGroupsWithGovernance(id string, user *User, columns []string) (in
 	if !existed {
 		return rollback(fmt.Errorf("the user: %s is not found", id))
 	}
+	renamed := name != user.Name
+	if renamed {
+		if err = moveUserIdentityReferencesInSession(session, stored, user.Name); err != nil {
+			return rollback(err)
+		}
+	}
+	if !util.InSlice(columns, "groups") {
+		user.Groups = append([]string{}, stored.Groups...)
+	}
 	if err = CheckUserSodInSession(session, stored, user, ""); err != nil {
 		return rollback(err)
 	}
@@ -1071,6 +1094,11 @@ func updateUserGroupsWithGovernance(id string, user *User, columns []string) (in
 	if err != nil {
 		return rollback(err)
 	}
+	if renamed {
+		if err = userEnforcer.deleteGroupsForUserInSession(session, stored.GetId()); err != nil {
+			return rollback(err)
+		}
+	}
 	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
 		return rollback(err)
 	}
@@ -1078,7 +1106,7 @@ func updateUserGroupsWithGovernance(id string, user *User, columns []string) (in
 		return rollback(err)
 	}
 	if err = userEnforcer.publishCommittedGroups(); err != nil {
-		return 0, err
+		return affected, err
 	}
 	return affected, nil
 }
@@ -1116,12 +1144,8 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 	if oldUser == nil {
 		return false, fmt.Errorf("the user: %s is not found", id)
 	}
-
-	if name != user.Name {
-		err := userChangeTrigger(owner, name, user.Name)
-		if err != nil {
-			return false, err
-		}
+	if user.Owner != owner {
+		return false, fmt.Errorf("moving a user between organizations is not supported: %s -> %s", owner, user.Owner)
 	}
 
 	err = user.UpdateUserHash()
@@ -1142,8 +1166,12 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 	// happens to match. Re-read and validate under the organization lock so a
 	// concurrent membership change cannot be restored from stale profile data.
 	affected, err := updateUserAllFieldsGroupsWithGovernance(id, user)
+	var publicationErr error
 	if err != nil {
-		return false, err
+		if affected == 0 {
+			return false, err
+		}
+		publicationErr = err
 	}
 
 	if affected != 0 {
@@ -1153,8 +1181,15 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 	if affected != 0 && isUserAccessRevoked(oldUser, user, nil) {
 		err = TerminateUserAccess(oldUser)
 		if err != nil {
-			return true, fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+			terminationErr := fmt.Errorf("the user: %s is updated, but terminating its access failed: %w", id, err)
+			if publicationErr != nil {
+				return true, errors.Join(publicationErr, terminationErr)
+			}
+			return true, terminationErr
 		}
+	}
+	if publicationErr != nil {
+		return true, fmt.Errorf("the user: %s is updated, but publishing its committed group policy failed: %w", id, publicationErr)
 	}
 
 	return affected != 0, nil
@@ -1162,6 +1197,9 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 
 func updateUserAllFieldsGroupsWithGovernance(id string, user *User) (int64, error) {
 	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
+	if user.Owner != owner {
+		return 0, fmt.Errorf("moving a user between organizations is not supported: %s -> %s", owner, user.Owner)
+	}
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 	if err := session.Begin(); err != nil {
@@ -1182,12 +1220,23 @@ func updateUserAllFieldsGroupsWithGovernance(id string, user *User) (int64, erro
 	if !existed {
 		return rollback(fmt.Errorf("the user: %s is not found", id))
 	}
+	renamed := name != user.Name
+	if renamed {
+		if err = moveUserIdentityReferencesInSession(session, stored, user.Name); err != nil {
+			return rollback(err)
+		}
+	}
 	if err = CheckUserSodInSession(session, stored, user, ""); err != nil {
 		return rollback(err)
 	}
 	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(user)
 	if err != nil {
 		return rollback(err)
+	}
+	if renamed {
+		if err = userEnforcer.deleteGroupsForUserInSession(session, stored.GetId()); err != nil {
+			return rollback(err)
+		}
 	}
 	if err = userEnforcer.replaceGroupsForUserInSession(session, user.GetId(), user.Groups); err != nil {
 		return rollback(err)
@@ -1196,7 +1245,7 @@ func updateUserAllFieldsGroupsWithGovernance(id string, user *User) (int64, erro
 		return rollback(err)
 	}
 	if err = userEnforcer.publishCommittedGroups(); err != nil {
-		return 0, err
+		return affected, err
 	}
 	return affected, nil
 }
@@ -1325,6 +1374,11 @@ func AddUser(user *User, lang string) (bool, error) {
 	if err = lockGovernanceScope(session, user.Owner); err != nil {
 		return rollback(err)
 	}
+	if dependency, err := getUserIdentityDependencyInSession(session, user, false); err != nil {
+		return rollback(err)
+	} else if dependency != "" {
+		return rollback(fmt.Errorf("the user cannot be added while an existing %s depends on the same identity: %s", dependency, user.GetId()))
+	}
 	if err = CheckUserSodInSession(session, nil, user, lang); err != nil {
 		return rollback(err)
 	}
@@ -1410,7 +1464,14 @@ func AddUsers(users []*User) (bool, error) {
 			return rollback(err)
 		}
 	}
+	dependencies, err := getUserIdentityDependenciesInSession(session, users, false)
+	if err != nil {
+		return rollback(err)
+	}
 	for _, user := range users {
+		if dependency := dependencies[user.GetId()]; dependency != "" {
+			return rollback(fmt.Errorf("the user cannot be added while an existing %s depends on the same identity: %s", dependency, user.GetId()))
+		}
 		if err := CheckUserSodInSession(session, nil, user, ""); err != nil {
 			return rollback(err)
 		}
@@ -1466,9 +1527,52 @@ func AddUsersInBatch(users []*User) (bool, error) {
 }
 
 func deleteUser(user *User) (bool, error) {
-	affected, err := ormer.Engine.ID(core.PK{user.Owner, user.Name}).Delete(&User{})
-	if err != nil {
+	return deleteUserWithGovernance(user, false)
+}
+
+func deleteUserWithGovernance(user *User, prepare bool) (bool, error) {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, user.Owner); err != nil {
+		return rollback(err)
+	}
+	stored := &User{Owner: user.Owner, Name: user.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+	dependency, err := getUserIdentityDependencyInSession(session, stored, false)
+	if err != nil {
+		return rollback(err)
+	}
+	if dependency != "" {
+		return rollback(fmt.Errorf("the user cannot be deleted while a %s depends on it: %s", dependency, stored.GetId()))
+	}
+	if prepare {
+		if err = prepareUserDeletion(stored); err != nil {
+			return rollback(err)
+		}
+	}
+	if err = deleteUserAuthenticationArtifactsInSession(session, stored); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Delete(&User{})
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
 	}
 
 	return affected != 0, nil
@@ -1583,17 +1687,10 @@ func prepareUserDeletion(user *User) error {
 }
 
 func deleteUserPermanentlyForMerge(user *User) (bool, error) {
-	if err := prepareUserDeletion(user); err != nil {
-		return false, err
-	}
-	return deleteUser(user)
+	return deleteUserWithGovernance(user, true)
 }
 
 func DeleteUser(user *User) (bool, error) {
-	if err := prepareUserDeletion(user); err != nil {
-		return false, err
-	}
-
 	organization, err := GetOrganizationByUser(user)
 	if err != nil {
 		return false, err
@@ -1606,13 +1703,16 @@ func DeleteUser(user *User) (bool, error) {
 
 		// Deleting a user that is already soft-deleted removes it permanently
 		if oldUser != nil && !oldUser.IsDeleted {
+			if err = prepareUserDeletion(oldUser); err != nil {
+				return false, err
+			}
 			user.IsDeleted = true
 			user.DeletedTime = util.GetCurrentTime()
 			return UpdateUser(user.GetId(), user, []string{"is_deleted", "deleted_time"}, false)
 		}
 	}
 
-	return deleteUser(user)
+	return deleteUserWithGovernance(user, true)
 }
 
 func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, error) {
@@ -1850,17 +1950,33 @@ func DeleteGroupForUser(user string, group string) (bool, error) {
 	return true, nil
 }
 
-func userChangeTrigger(owner string, oldName string, newName string) error {
-	session := ormer.Engine.NewSession()
-	defer session.Close()
-
-	err := session.Begin()
+func moveUserIdentityReferencesInSession(session *xorm.Session, oldUser *User, newName string) error {
+	owner, oldName := oldUser.Owner, oldUser.Name
+	dependency, err := getUserIdentityDependencyInSession(session, oldUser, true)
 	if err != nil {
 		return err
 	}
+	if dependency != "" {
+		return fmt.Errorf("the user cannot be renamed while a %s depends on it: %s", dependency, oldUser.GetId())
+	}
+	destinationUser := &User{Owner: owner, Name: newName}
+	destinationExists, err := session.ForUpdate().Get(destinationUser)
+	if err != nil {
+		return err
+	}
+	if destinationExists {
+		return fmt.Errorf("the user cannot be renamed because the destination identity already exists: %s", destinationUser.GetId())
+	}
+	destinationDependency, err := getUserIdentityDependencyInSession(session, destinationUser, false)
+	if err != nil {
+		return err
+	}
+	if destinationDependency != "" {
+		return fmt.Errorf("the user cannot be renamed while an existing %s depends on the destination identity: %s", destinationDependency, destinationUser.GetId())
+	}
 
 	var roles []*Role
-	err = ormer.Engine.Find(&roles)
+	err = session.Find(&roles)
 	if err != nil {
 		return err
 	}
@@ -1887,37 +2003,6 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		}
 	}
 
-	var permissions []*Permission
-	err = ormer.Engine.Find(&permissions)
-	if err != nil {
-		return err
-	}
-	for _, permission := range permissions {
-		changed := false
-		for j, u := range permission.Users {
-			if u == "*" {
-				continue
-			}
-
-			// u = organization/username
-			permOwner, permName, err := util.GetOwnerAndNameFromIdWithError(u)
-			if err != nil {
-				return err
-			}
-			if permOwner == owner && permName == oldName {
-				permission.Users[j] = util.GetId(permOwner, newName)
-				changed = true
-			}
-		}
-		if !changed {
-			continue
-		}
-		_, err = session.Where("name=?", permission.Name).And("owner=?", permission.Owner).Update(permission)
-		if err != nil {
-			return err
-		}
-	}
-
 	_, err = session.Where(fmt.Sprintf("owner = ? AND %s = ?", quoteColumn("user")), owner, oldName).Cols("user").Update(&Resource{User: newName})
 	if err != nil {
 		return err
@@ -1938,12 +2023,199 @@ func userChangeTrigger(owner string, oldName string, newName string) error {
 		return err
 	}
 
-	err = userEnforcer.RenameUser(util.GetId(owner, oldName), util.GetId(owner, newName))
+	return nil
+}
+
+func hasPermissionUsingUserInSession(session *xorm.Session, userId string) (bool, error) {
+	permissions := []*Permission{}
+	if err := session.Cols("users").Find(&permissions); err != nil {
+		return false, err
+	}
+	for _, permission := range permissions {
+		if util.InSlice(permission.Users, userId) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// getUserIdentityDependencyInSession returns a live authorization or ownership record that
+// would be inherited by a later user with the same organization/name identity. A rename may
+// skip roles and resources because moveUserIdentityReferencesInSession migrates both in the same transaction.
+// Historical/audit records intentionally do not reserve an identity.
+func getUserIdentityDependencyInSession(session *xorm.Session, user *User, rename bool) (string, error) {
+	dependencies, err := getUserIdentityDependenciesInSession(session, []*User{user}, rename)
 	if err != nil {
-		return err
+		return "", err
+	}
+	return dependencies[user.GetId()], nil
+}
+
+// getUserIdentityDependenciesInSession loads every selector once so syncer/batch imports do
+// not rescan all governance records for every user in the batch.
+func getUserIdentityDependenciesInSession(session *xorm.Session, users []*User, rename bool) (map[string]string, error) {
+	dependencies := map[string]string{}
+	targets := map[string]*User{}
+	owners := []string{}
+	ownerSeen := map[string]bool{}
+	for _, user := range users {
+		if user == nil || user.Owner == "" || user.Name == "" {
+			continue
+		}
+		targets[user.GetId()] = user
+		if !ownerSeen[user.Owner] {
+			ownerSeen[user.Owner] = true
+			owners = append(owners, user.Owner)
+		}
+	}
+	if len(targets) == 0 {
+		return dependencies, nil
+	}
+	setById := func(id string, dependency string) {
+		if _, targeted := targets[id]; targeted && dependencies[id] == "" {
+			dependencies[id] = dependency
+		}
+	}
+	setByName := func(owner string, name string, dependency string) {
+		setById(util.GetId(owner, name), dependency)
 	}
 
-	return session.Commit()
+	permissions := []*Permission{}
+	if err := session.Cols("users").Find(&permissions); err != nil {
+		return nil, err
+	}
+	for _, permission := range permissions {
+		for _, id := range permission.Users {
+			setById(id, "permission")
+		}
+	}
+
+	if !rename {
+		roles := []*Role{}
+		if err := session.Cols("users").Find(&roles); err != nil {
+			return nil, err
+		}
+		for _, role := range roles {
+			for _, id := range role.Users {
+				setById(id, "role")
+			}
+		}
+	}
+
+	organizations := []*Organization{}
+	if err := session.Cols("name", "enterprise_policy").Where("owner = ?", "admin").In("name", owners).Find(&organizations); err != nil {
+		return nil, err
+	}
+	for _, organization := range organizations {
+		policy := organization.EnterprisePolicy
+		if policy == nil {
+			continue
+		}
+		for _, adminNames := range [][]string{policy.SystemAdmins, policy.SecurityAdmins, policy.AuditAdmins} {
+			for _, name := range adminNames {
+				setByName(organization.Name, name, "enterprise administrator policy")
+			}
+		}
+		for _, delegatedAdmin := range policy.DelegatedAdmins {
+			if delegatedAdmin != nil {
+				setByName(organization.Name, delegatedAdmin.User, "delegated administrator policy")
+			}
+		}
+	}
+
+	applications := []*Application{}
+	if err := session.Cols("external_users").Find(&applications); err != nil {
+		return nil, err
+	}
+	for _, application := range applications {
+		for _, id := range application.ExternalUsers {
+			setById(id, "external application grant")
+		}
+	}
+
+	accounts := []*PrivilegedAccount{}
+	if err := session.Cols("owner", "users", "approvers").In("owner", owners).Find(&accounts); err != nil {
+		return nil, err
+	}
+	for _, account := range accounts {
+		for _, name := range account.Users {
+			setByName(account.Owner, name, "privileged account policy")
+		}
+		for _, name := range account.Approvers {
+			setByName(account.Owner, name, "privileged account policy")
+		}
+	}
+
+	requests := []*PrivilegedRequest{}
+	if err := session.Cols("owner", "requester").In("owner", owners).In("state", []string{PamStatePending, PamStateApproved, PamStateActive}).Find(&requests); err != nil {
+		return nil, err
+	}
+	for _, request := range requests {
+		setByName(request.Owner, request.Requester, "active privileged access request")
+	}
+
+	subscriptions := []*Subscription{}
+	if err := session.Cols("owner", "user").In("owner", owners).Find(&subscriptions); err != nil {
+		return nil, err
+	}
+	for _, subscription := range subscriptions {
+		setByName(subscription.Owner, subscription.User, "subscription")
+	}
+
+	keys := []*Key{}
+	if err := session.Cols("organization", "user").In("organization", owners).Find(&keys); err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		setByName(key.Organization, key.User, "access key")
+	}
+
+	if !rename {
+		resources := []*Resource{}
+		if err := session.Cols("owner", "user").In("owner", owners).Find(&resources); err != nil {
+			return nil, err
+		}
+		for _, resource := range resources {
+			setByName(resource.Owner, resource.User, "resource")
+		}
+	}
+
+	pricings := []*Pricing{}
+	if err := session.Cols("owner", "users").In("owner", owners).Find(&pricings); err != nil {
+		return nil, err
+	}
+	for _, pricing := range pricings {
+		for _, name := range pricing.Users {
+			setByName(pricing.Owner, name, "invite-only pricing")
+		}
+	}
+
+	coupons := []*Coupon{}
+	if err := session.Cols("owner", "users").In("owner", owners).Find(&coupons); err != nil {
+		return nil, err
+	}
+	for _, coupon := range coupons {
+		for _, name := range coupon.Users {
+			setByName(coupon.Owner, name, "user-scoped coupon")
+		}
+	}
+
+	return dependencies, nil
+}
+
+func deleteUserAuthenticationArtifactsInSession(session *xorm.Session, user *User) error {
+	if _, err := session.Where(fmt.Sprintf("%s = ?", quoteColumn("user")), user.GetId()).Delete(&CertLoginTicket{}); err != nil {
+		return err
+	}
+	if _, err := session.Where(fmt.Sprintf("owner = ? and %s = ?", quoteColumn("user")), user.Owner, user.GetId()).Delete(&VerificationRecord{}); err != nil {
+		return err
+	}
+	if user.Email != "" {
+		if _, err := session.Where("owner = ? and email = ?", user.Owner, user.Email).Delete(&MagicLink{}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (user *User) IsMfaEnabled() bool {

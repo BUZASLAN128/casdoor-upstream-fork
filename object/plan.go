@@ -45,8 +45,10 @@ type Plan struct {
 }
 
 const (
-	PeriodMonthly = "Monthly"
-	PeriodYearly  = "Yearly"
+	PeriodMonthly              = "Monthly"
+	PeriodYearly               = "Yearly"
+	planManagedProductProperty = "casdoorPlanId"
+	planManagedProductTag      = "auto_created_product_for_plan"
 )
 
 func (plan *Plan) GetId() string {
@@ -71,6 +73,51 @@ func hasPlanUsingRoleInSession(session *xorm.Session, owner string, roleId strin
 		}
 	}
 	return false, nil
+}
+
+func validatePlanRoleInSession(session *xorm.Session, plan *Plan) error {
+	roleId := plan.GetRoleId()
+	if roleId == "" {
+		plan.Role = ""
+		return nil
+	}
+	roleOwner, roleName, err := util.GetOwnerAndNameFromIdWithError(roleId)
+	if err != nil {
+		return err
+	}
+	if roleOwner != plan.Owner {
+		return fmt.Errorf("the plan role is outside its organization: %s", roleId)
+	}
+	role := &Role{Owner: roleOwner, Name: roleName}
+	existed, err := session.ForUpdate().Get(role)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return fmt.Errorf("the plan role does not exist: %s", roleId)
+	}
+	plan.Role = roleId
+	return nil
+}
+
+func hasPlanUsingProductInSession(session *xorm.Session, owner string, productName string, excludePlanName string) (bool, error) {
+	query := session.Where("owner = ? and product = ?", owner, productName)
+	if excludePlanName != "" {
+		query = query.And("name <> ?", excludePlanName)
+	}
+	count, err := query.Count(&Plan{})
+	return count != 0, err
+}
+
+func isProductManagedByPlan(product *Product, plan *Plan) bool {
+	if product == nil || plan == nil || product.Properties == nil {
+		return false
+	}
+	return product.Properties[planManagedProductProperty] == plan.GetId()
+}
+
+func isUnclaimedLegacyPlanProduct(product *Product) bool {
+	return product != nil && product.Tag == planManagedProductTag && (product.Properties == nil || product.Properties[planManagedProductProperty] == "")
 }
 
 func getDurationFrom(period string, startTime time.Time) (string, string, error) {
@@ -168,6 +215,10 @@ func UpdatePlan(id string, plan *Plan) (bool, error) {
 	updated := *plan
 	updated.Owner = owner
 	updated.Name = name
+	updated.Product = oldPlan.Product
+	if err = validatePlanRoleInSession(session, &updated); err != nil {
+		return rollback(err)
+	}
 	if oldPlan.GetRoleId() != updated.GetRoleId() {
 		count, countErr := session.Where("owner = ? and plan = ?", owner, name).Count(&Subscription{})
 		if countErr != nil {
@@ -183,14 +234,31 @@ func UpdatePlan(id string, plan *Plan) (bool, error) {
 		if productErr != nil {
 			return rollback(productErr)
 		}
-		if productExists {
-			UpdateProductForPlan(&updated, product)
-			if productErr = checkProduct(product); productErr != nil {
-				return rollback(productErr)
+		if !productExists {
+			return rollback(fmt.Errorf("the plan-managed product does not exist: %s/%s", owner, updated.Product))
+		}
+		shared, sharedErr := hasPlanUsingProductInSession(session, owner, updated.Product, name)
+		if sharedErr != nil {
+			return rollback(sharedErr)
+		}
+		if shared {
+			return rollback(fmt.Errorf("the plan product is shared by another plan: %s/%s", owner, updated.Product))
+		}
+		if !isProductManagedByPlan(product, oldPlan) {
+			if !isUnclaimedLegacyPlanProduct(product) {
+				return rollback(fmt.Errorf("the plan product is not exclusively bound to the plan: %s/%s", owner, updated.Product))
 			}
-			if _, productErr = session.ID(core.PK{product.Owner, product.Name}).AllCols().Update(product); productErr != nil {
-				return rollback(productErr)
+			if product.Properties == nil {
+				product.Properties = map[string]string{}
 			}
+			product.Properties[planManagedProductProperty] = oldPlan.GetId()
+		}
+		UpdateProductForPlan(&updated, product)
+		if productErr = checkProduct(product); productErr != nil {
+			return rollback(productErr)
+		}
+		if _, productErr = session.ID(core.PK{product.Owner, product.Name}).AllCols().Update(product); productErr != nil {
+			return rollback(productErr)
 		}
 	}
 
@@ -206,10 +274,48 @@ func UpdatePlan(id string, plan *Plan) (bool, error) {
 }
 
 func AddPlan(plan *Plan) (bool, error) {
-	affected, err := ormer.Engine.Insert(plan)
-	if err != nil {
+	if plan == nil || plan.Owner == "" || plan.Name == "" {
+		return false, fmt.Errorf("the plan identity is empty")
+	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
 		return false, err
 	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockGovernanceScope(session, plan.Owner); err != nil {
+		return rollback(err)
+	}
+	existing := &Plan{Owner: plan.Owner, Name: plan.Name}
+	if existed, err := session.ForUpdate().Get(existing); err != nil {
+		return rollback(err)
+	} else if existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+	created := *plan
+	if err := validatePlanRoleInSession(session, &created); err != nil {
+		return rollback(err)
+	}
+	product := CreateProductForPlan(&created)
+	if err := checkProduct(product); err != nil {
+		return rollback(err)
+	}
+	created.Product = product.Name
+	if _, err := session.Insert(product); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.Insert(&created)
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*plan = created
 	return affected != 0, nil
 }
 
@@ -245,8 +351,19 @@ func DeletePlan(plan *Plan) (bool, error) {
 	}
 
 	if stored.Product != "" {
-		if _, err = session.ID(core.PK{stored.Owner, stored.Product}).Delete(&Product{}); err != nil {
-			return rollback(err)
+		product := &Product{Owner: stored.Owner, Name: stored.Product}
+		productExists, productErr := session.ForUpdate().Get(product)
+		if productErr != nil {
+			return rollback(productErr)
+		}
+		shared, sharedErr := hasPlanUsingProductInSession(session, stored.Owner, stored.Product, stored.Name)
+		if sharedErr != nil {
+			return rollback(sharedErr)
+		}
+		if productExists && !shared && isProductManagedByPlan(product, stored) {
+			if _, err = session.ID(core.PK{stored.Owner, stored.Product}).Delete(&Product{}); err != nil {
+				return rollback(err)
+			}
 		}
 	}
 	affected, err := session.ID(core.PK{plan.Owner, plan.Name}).Delete(Plan{})

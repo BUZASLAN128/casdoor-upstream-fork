@@ -15,14 +15,37 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/casdoor/casdoor/util"
+	"github.com/lib/pq"
 	"github.com/robfig/cron/v3"
 	"github.com/xorm-io/core"
 	"github.com/xorm-io/xorm"
 )
+
+const subscriptionTransactionAttempts = 4
+
+func retrySubscriptionTransaction(operation func() error) error {
+	var err error
+	for attempt := 0; attempt < subscriptionTransactionAttempts; attempt++ {
+		err = operation()
+		if err == nil || !isRetryableSubscriptionTransactionError(err) {
+			return err
+		}
+		if attempt+1 < subscriptionTransactionAttempts {
+			time.Sleep(time.Duration(1<<attempt) * 10 * time.Millisecond)
+		}
+	}
+	return err
+}
+
+func isRetryableSubscriptionTransactionError(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == pq.ErrorCode("40001")
+}
 
 func (sub *Subscription) isActiveAt(now time.Time) bool {
 	if sub.State != SubStateActive && sub.State != SubStateUpcoming && sub.State != SubStateExpired {
@@ -200,7 +223,7 @@ func updatePaymentSubscriptions(payment *Payment) error {
 	}
 
 	for _, sub := range subscriptions {
-		err = sub.UpdateState()
+		err = retrySubscriptionTransaction(sub.UpdateState)
 		if err != nil {
 			return err
 		}
@@ -219,14 +242,14 @@ func UpdateSubscriptionStates() error {
 
 	now := time.Now()
 	for _, sub := range subscriptions {
-		err = sub.UpdateState()
+		err = retrySubscriptionTransaction(sub.UpdateState)
 		if err != nil {
 			fmt.Printf("UpdateSubscriptionStates() error for subscription %s: %v\n", sub.GetId(), err)
 			continue
 		}
 
 		if sub.State == SubStateActive {
-			err = syncSubscriptionRole(sub)
+			err = retrySubscriptionTransaction(func() error { return syncSubscriptionRole(sub) })
 			if err != nil {
 				fmt.Printf("UpdateSubscriptionStates() error for subscription %s: %v\n", sub.GetId(), err)
 			}

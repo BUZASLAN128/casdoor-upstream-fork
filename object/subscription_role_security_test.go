@@ -1,10 +1,13 @@
 package object
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 func subscriptionFunctionSource(t *testing.T, source string, functionName string) string {
@@ -33,6 +36,29 @@ func TestCerberusSecuritySubscriptionRoleMembershipMutation(t *testing.T) {
 	members, changed = getSubscriptionRoleMembersAfterMutation(members, "tenant-a/existing", false)
 	if !changed || len(members) != 1 || members[0] != "tenant-a/new" {
 		t.Fatalf("role removal = (%#v, %v), want only new member", members, changed)
+	}
+}
+
+func TestCerberusSecuritySubscriptionTransactionRetryIsBounded(t *testing.T) {
+	attempts := 0
+	err := retrySubscriptionTransaction(func() error {
+		attempts++
+		if attempts < 3 {
+			return &pq.Error{Code: pq.ErrorCode("40001")}
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Fatalf("retryable transaction = (%d attempts, %v), want 3 attempts and success", attempts, err)
+	}
+
+	attempts = 0
+	err = retrySubscriptionTransaction(func() error {
+		attempts++
+		return fmt.Errorf("permanent")
+	})
+	if err == nil || attempts != 1 {
+		t.Fatalf("permanent failure = (%d attempts, %v), want one attempt and failure", attempts, err)
 	}
 }
 
@@ -256,6 +282,16 @@ func TestCerberusSecurityPlanAndProductMutateAtomically(t *testing.T) {
 	if deleteGuard < 0 || deleteProduct < 0 || deleteGuard > deleteProduct {
 		t.Fatal("plan subscription guard must run before its product is deleted")
 	}
+	addBody := subscriptionFunctionSource(t, planSource, "AddPlan")
+	productInsert := strings.Index(addBody, "session.Insert(product)")
+	planInsert := strings.Index(addBody, "session.Insert(&created)")
+	commit := strings.Index(addBody, "session.Commit()")
+	if productInsert < 0 || planInsert < 0 || commit < 0 || productInsert > planInsert || planInsert > commit {
+		t.Fatal("plan creation must commit its managed product and plan together")
+	}
+	if !strings.Contains(addBody, "validatePlanRoleInSession(") {
+		t.Fatal("plan creation must validate its role under the governance lock")
+	}
 
 	controllerBytes, err := os.ReadFile("../controllers/plan.go")
 	if err != nil {
@@ -306,6 +342,10 @@ func TestCerberusSecurityGroupRenameIsAtomicAndRejectsOccupiedTarget(t *testing.
 	if targetPos < 0 || referencesPos < 0 || rowPos < 0 || commitPos < 0 || targetPos > referencesPos || referencesPos > rowPos || rowPos > commitPos {
 		t.Fatal("group rename must reject an occupied target and commit identity plus references together")
 	}
+	permissionGuard := strings.Index(body, "hasPermissionUsingGroupInSession(")
+	if permissionGuard < 0 || permissionGuard > referencesPos {
+		t.Fatal("group rename must reject permission dependencies before moving its identity")
+	}
 	referencesBody := subscriptionFunctionSource(t, string(groupSourceBytes), "groupChangeInSession")
 	roleWritePos := strings.Index(referencesBody, `.Cols("groups").Update(role)`)
 	finalSodPos := strings.LastIndex(referencesBody, "CheckUserSodInSession(")
@@ -329,6 +369,110 @@ func TestCerberusSecurityRoleRenameMovesIdentityAndReferencesAtomically(t *testi
 	}
 	if strings.Contains(body, "roleChangeTrigger(") {
 		t.Fatal("role rename must not commit dependent references through a nested transaction")
+	}
+	permissionGuard := strings.Index(body, "hasPermissionUsingRoleInSession(")
+	if permissionGuard < 0 || permissionGuard > referencesPos {
+		t.Fatal("role rename must reject permission dependencies before moving its identity")
+	}
+	if strings.Contains(body, "removePolicies(") || strings.Contains(body, "addPolicies(") {
+		t.Fatal("role rename must not publish permission policies after its database commit")
+	}
+}
+
+func TestCerberusSecurityRoleAndGroupDeletionPreservePermissionIdentity(t *testing.T) {
+	tests := []struct {
+		file       string
+		function   string
+		dependency string
+	}{
+		{"role.go", "DeleteRole", "hasPermissionUsingRoleInSession("},
+		{"group.go", "DeleteGroup", "hasPermissionUsingGroupInSession("},
+	}
+	for _, tt := range tests {
+		sourceBytes, err := os.ReadFile(tt.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", tt.file, err)
+		}
+		body := subscriptionFunctionSource(t, string(sourceBytes), tt.function)
+		if !strings.Contains(body, tt.dependency) {
+			t.Fatalf("%s must reject deletion while a permission depends on the identity", tt.function)
+		}
+		if strings.Contains(body, "UpdatePermission(") {
+			t.Fatalf("%s must not mutate permission state outside its transaction", tt.function)
+		}
+	}
+	roleSource, err := os.ReadFile("role.go")
+	if err != nil {
+		t.Fatalf("read role.go: %v", err)
+	}
+	deleteRole := subscriptionFunctionSource(t, string(roleSource), "DeleteRole")
+	if !strings.Contains(deleteRole, "hasRoleUsingRoleInSession(") {
+		t.Fatal("DeleteRole must reject deletion while another role inherits it")
+	}
+}
+
+func TestCerberusSecurityUserRenamePreservesPermissionIdentity(t *testing.T) {
+	sourceBytes, err := os.ReadFile("user.go")
+	if err != nil {
+		t.Fatalf("read user.go: %v", err)
+	}
+	body := subscriptionFunctionSource(t, string(sourceBytes), "moveUserIdentityReferencesInSession")
+	guard := strings.Index(body, "getUserIdentityDependencyInSession(")
+	roleWrites := strings.Index(body, `.Update(role)`)
+	if guard < 0 || roleWrites < 0 || guard > roleWrites {
+		t.Fatal("user rename must reject permission dependencies before moving identity references")
+	}
+	if strings.Contains(body, "Update(permission)") {
+		t.Fatal("user rename must not leave persisted permission policies under the old identity")
+	}
+}
+
+func TestCerberusSecurityPermissionWritersSerializeIdentityAndPolicy(t *testing.T) {
+	sourceBytes, err := os.ReadFile("permission.go")
+	if err != nil {
+		t.Fatalf("read permission.go: %v", err)
+	}
+	source := string(sourceBytes)
+	tests := []struct {
+		function string
+		policy   string
+	}{
+		{"UpdatePermission", "replacePermissionPoliciesInSession("},
+		{"UpdatePermissions", "replacePermissionPoliciesInSession("},
+		{"AddPermission", "addPermissionPoliciesInSession("},
+		{"AddPermissions", "addPermissionPoliciesInSession("},
+		{"deletePermissionRecord", "removePermissionPoliciesInSession("},
+	}
+	for _, tt := range tests {
+		body := subscriptionFunctionSource(t, source, tt.function)
+		lockPos := strings.Index(body, "lockPermissionGovernance(")
+		policyPos := strings.Index(body, tt.policy)
+		commitPos := strings.Index(body, "session.Commit()")
+		if lockPos < 0 || policyPos < 0 || commitPos < 0 || lockPos > policyPos || policyPos > commitPos {
+			t.Fatalf("%s must serialize identity references and commit permission data with its policy", tt.function)
+		}
+	}
+}
+
+func TestCerberusSecurityCommittedUserRevocationSurvivesPolicyPublishFailure(t *testing.T) {
+	sourceBytes, err := os.ReadFile("user.go")
+	if err != nil {
+		t.Fatalf("read user.go: %v", err)
+	}
+	userSource := string(sourceBytes)
+	for _, functionName := range []string{"UpdateUser", "UpdateUserForAllFields"} {
+		body := subscriptionFunctionSource(t, userSource, functionName)
+		capture := strings.Index(body, "publicationErr = err")
+		revoke := strings.Index(body, "TerminateUserAccess(oldUser)")
+		if capture < 0 || revoke < 0 || capture > revoke {
+			t.Fatalf("%s must continue to mandatory access revocation after a committed policy publication failure", functionName)
+		}
+	}
+	for _, functionName := range []string{"updateUserGroupsWithGovernance", "updateUserAllFieldsGroupsWithGovernance"} {
+		body := subscriptionFunctionSource(t, userSource, functionName)
+		if !strings.Contains(body, "return affected, err") {
+			t.Fatalf("%s must report that its database mutation committed when policy publication fails", functionName)
+		}
 	}
 }
 

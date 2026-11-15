@@ -21,6 +21,7 @@ import (
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 type Permission struct {
@@ -159,6 +160,209 @@ func checkPermissionModel(permission *Permission) error {
 	return nil
 }
 
+func permissionGovernanceOwners(permission *Permission) ([]string, error) {
+	owners := []string{permission.Owner}
+	references := append([]string{}, permission.Users...)
+	references = append(references, permission.Groups...)
+	references = append(references, permission.Roles...)
+	for _, reference := range references {
+		if reference == "*" {
+			continue
+		}
+		owner, _, err := util.GetOwnerAndNameFromIdWithError(reference)
+		if err != nil {
+			return nil, err
+		}
+		owners = append(owners, owner)
+	}
+	return owners, nil
+}
+
+func lockPermissionGovernance(session *xorm.Session, permissions ...*Permission) error {
+	owners := []string{}
+	for _, permission := range permissions {
+		if permission == nil {
+			continue
+		}
+		permissionOwners, err := permissionGovernanceOwners(permission)
+		if err != nil {
+			return err
+		}
+		owners = append(owners, permissionOwners...)
+	}
+	return lockGovernanceScopes(session, owners...)
+}
+
+func permissionGovernanceLocksCover(candidates []*Permission, current *Permission) (bool, error) {
+	lockedOwners := map[string]bool{}
+	for _, candidate := range candidates {
+		owners, err := permissionGovernanceOwners(candidate)
+		if err != nil {
+			return false, err
+		}
+		for _, owner := range owners {
+			lockedOwners[owner] = true
+		}
+	}
+	currentOwners, err := permissionGovernanceOwners(current)
+	if err != nil {
+		return false, err
+	}
+	for _, owner := range currentOwners {
+		if !lockedOwners[owner] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func validatePermissionReferencesInSession(session *xorm.Session, permission *Permission) error {
+	for _, userId := range permission.Users {
+		if userId == "*" {
+			continue
+		}
+		userOwner, userName, err := util.GetOwnerAndNameFromIdWithError(userId)
+		if err != nil {
+			return err
+		}
+		if userName == "*" {
+			continue
+		}
+		existed, err := session.ID(core.PK{userOwner, userName}).Exist(&User{})
+		if err != nil {
+			return err
+		}
+		if !existed {
+			return fmt.Errorf("the permission user does not exist: %s", userId)
+		}
+	}
+	for _, groupId := range permission.Groups {
+		groupId = getPermissionGroupId(permission.Owner, groupId)
+		groupOwner, groupName, err := util.GetOwnerAndNameFromIdWithError(groupId)
+		if err != nil {
+			return err
+		}
+		if groupName == "*" {
+			continue
+		}
+		existed, err := session.ID(core.PK{groupOwner, groupName}).Exist(&Group{})
+		if err != nil {
+			return err
+		}
+		if !existed {
+			return fmt.Errorf("the permission group does not exist: %s", groupId)
+		}
+	}
+	for _, roleId := range permission.Roles {
+		if roleId == "*" {
+			roleId = util.GetId(permission.Owner, "*")
+		}
+		roleOwner, roleName, err := util.GetOwnerAndNameFromIdWithError(roleId)
+		if err != nil {
+			return err
+		}
+		if roleName == "*" {
+			continue
+		}
+		existed, err := session.ID(core.PK{roleOwner, roleName}).Exist(&Role{})
+		if err != nil {
+			return err
+		}
+		if !existed {
+			return fmt.Errorf("the permission role does not exist: %s", roleId)
+		}
+	}
+	return nil
+}
+
+func permissionPolicyTableName(session *xorm.Session, permission *Permission) (string, error) {
+	return resolvePermissionPolicyTableName(session, permission, true)
+}
+
+func resolvePermissionPolicyTableName(session *xorm.Session, permission *Permission, lock bool) (string, error) {
+	tableName := "permission_rule"
+	if permission.Adapter != "" {
+		adapter := &Adapter{Owner: permission.Owner, Name: permission.Adapter}
+		query := session
+		if lock {
+			query = query.ForUpdate()
+		}
+		existed, err := query.Get(adapter)
+		if err != nil {
+			return "", err
+		}
+		if !existed {
+			return "", fmt.Errorf("the permission adapter does not exist: %s/%s", permission.Owner, permission.Adapter)
+		}
+		if !adapter.UseSameDb && !adapter.isBuiltIn() {
+			return "", fmt.Errorf("the permission adapter must use Casdoor's database: %s", adapter.GetId())
+		}
+		if adapter.Table != "" {
+			tableName = adapter.Table
+		}
+	}
+	tableName = conf.GetConfigString("tableNamePrefix") + tableName
+	if !util.FilterSQLIdentifier(tableName) {
+		return "", fmt.Errorf("the permission policy table name is invalid: %s", tableName)
+	}
+	return tableName, nil
+}
+
+func removePermissionPoliciesInSession(session *xorm.Session, permission *Permission) error {
+	tableName, err := permissionPolicyTableName(session, permission)
+	if err != nil {
+		return err
+	}
+	_, err = session.Exec(fmt.Sprintf("DELETE FROM %s WHERE ptype = ? AND v5 = ?", ormer.Engine.Quote(tableName)), "p", permission.GetId())
+	return err
+}
+
+func addPermissionPoliciesInSession(session *xorm.Session, permission *Permission) error {
+	tableName, err := permissionPolicyTableName(session, permission)
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, policy := range getPolicies(permission) {
+		key := getPolicyKey(policy)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		rule := &safeCasbinRule{Ptype: "p"}
+		if len(policy) > 0 {
+			rule.V0 = policy[0]
+		}
+		if len(policy) > 1 {
+			rule.V1 = policy[1]
+		}
+		if len(policy) > 2 {
+			rule.V2 = policy[2]
+		}
+		if len(policy) > 3 {
+			rule.V3 = policy[3]
+		}
+		if len(policy) > 4 {
+			rule.V4 = policy[4]
+		}
+		if len(policy) > 5 {
+			rule.V5 = policy[5]
+		}
+		query := fmt.Sprintf("INSERT INTO %s (ptype, v0, v1, v2, v3, v4, v5) VALUES (?, ?, ?, ?, ?, ?, ?)", ormer.Engine.Quote(tableName))
+		if _, err = session.Exec(query, rule.Ptype, rule.V0, rule.V1, rule.V2, rule.V3, rule.V4, rule.V5); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func replacePermissionPoliciesInSession(session *xorm.Session, oldPermission *Permission, newPermission *Permission) error {
+	if err := removePermissionPoliciesInSession(session, oldPermission); err != nil {
+		return err
+	}
+	return addPermissionPoliciesInSession(session, newPermission)
+}
+
 func UpdatePermission(id string, permission *Permission) (bool, error) {
 	err := checkPermissionValid(permission)
 	if err != nil {
@@ -167,57 +371,80 @@ func UpdatePermission(id string, permission *Permission) (bool, error) {
 
 	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
 	oldPermission, err := getPermission(owner, name)
+	if err != nil {
+		return false, err
+	}
 	if oldPermission == nil {
 		return false, nil
 	}
-
-	err = checkPermissionModel(permission)
+	updated := *permission
+	updated.Owner = owner
+	updated.Name = name
+	err = checkPermissionModel(&updated)
 	if err != nil {
 		return false, err
 	}
-
-	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(permission)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
 		return false, err
 	}
-
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockPermissionGovernance(session, oldPermission, &updated); err != nil {
+		return rollback(err)
+	}
+	lockedOld := &Permission{Owner: owner, Name: name}
+	existed, err := session.ForUpdate().Get(lockedOld)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil
+	}
+	covered, err := permissionGovernanceLocksCover([]*Permission{oldPermission, &updated}, lockedOld)
+	if err != nil {
+		return rollback(err)
+	}
+	if !covered {
+		return rollback(fmt.Errorf("the permission governance references changed while updating it: %s", lockedOld.GetId()))
+	}
+	if err = validatePermissionReferencesInSession(session, &updated); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(&updated)
+	if err != nil {
+		return rollback(err)
+	}
 	if affected != 0 {
-		// if oldPermission.Adapter != "" && oldPermission.Adapter != permission.Adapter {
-		// 	isEmpty, _ := ormer.Engine.IsTableEmpty(oldPermission.Adapter)
-		// 	if isEmpty {
-		// 		err = ormer.Engine.DropTables(oldPermission.Adapter)
-		// 		if err != nil {
-		// 			return false, err
-		// 		}
-		// 	}
-		// }
-
-		err = updatePermissionsPolicies([]*Permission{oldPermission}, []*Permission{permission})
-		if err != nil {
-			return false, err
+		if err = replacePermissionPoliciesInSession(session, lockedOld, &updated); err != nil {
+			return rollback(err)
 		}
 	}
-
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	*permission = updated
 	return affected != 0, nil
 }
 
-// UpdatePermissions updates multiple permissions in a single call. Compared with issuing one
-// UpdatePermission request per permission, it rebuilds the Casbin policies grouped by model and
-// adapter, so each distinct enforcer is only constructed once instead of twice per permission.
+// UpdatePermissions commits each permission row and its persisted Casbin policy rows in one
+// transaction, while governance locks serialize changes to referenced groups and roles.
 func UpdatePermissions(permissions []*Permission) (bool, error) {
 	if len(permissions) == 0 {
 		return false, nil
 	}
 
-	oldPermissions := make([]*Permission, 0, len(permissions))
-	newPermissions := make([]*Permission, 0, len(permissions))
-
+	lockCandidates := make([]*Permission, 0, len(permissions)*2)
+	updatedPermissions := make([]*Permission, 0, len(permissions))
 	for _, permission := range permissions {
 		err := checkPermissionValid(permission)
 		if err != nil {
 			return false, err
 		}
-
 		owner, name := util.GetOwnerAndNameFromIdNoCheck(permission.GetId())
 		oldPermission, err := getPermission(owner, name)
 		if err != nil {
@@ -226,32 +453,68 @@ func UpdatePermissions(permissions []*Permission) (bool, error) {
 		if oldPermission == nil {
 			continue
 		}
-
-		err = checkPermissionModel(permission)
+		updated := *permission
+		updated.Owner = owner
+		updated.Name = name
+		err = checkPermissionModel(&updated)
 		if err != nil {
 			return false, err
 		}
-
-		affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(permission)
+		updatedPermissions = append(updatedPermissions, &updated)
+		lockCandidates = append(lockCandidates, oldPermission, &updated)
+	}
+	if len(updatedPermissions) == 0 {
+		return false, nil
+	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockPermissionGovernance(session, lockCandidates...); err != nil {
+		return rollback(err)
+	}
+	newPermissions := make([]*Permission, 0, len(updatedPermissions))
+	for _, updated := range updatedPermissions {
+		lockedOld := &Permission{Owner: updated.Owner, Name: updated.Name}
+		existed, err := session.ForUpdate().Get(lockedOld)
 		if err != nil {
-			return false, err
+			return rollback(err)
 		}
-
+		if !existed {
+			continue
+		}
+		covered, err := permissionGovernanceLocksCover(lockCandidates, lockedOld)
+		if err != nil {
+			return rollback(err)
+		}
+		if !covered {
+			return rollback(fmt.Errorf("the permission governance references changed while updating it: %s", lockedOld.GetId()))
+		}
+		if err = validatePermissionReferencesInSession(session, updated); err != nil {
+			return rollback(err)
+		}
+		affected, err := session.ID(core.PK{updated.Owner, updated.Name}).AllCols().Update(updated)
+		if err != nil {
+			return rollback(err)
+		}
 		if affected != 0 {
-			oldPermissions = append(oldPermissions, oldPermission)
-			newPermissions = append(newPermissions, permission)
+			if err = replacePermissionPoliciesInSession(session, lockedOld, updated); err != nil {
+				return rollback(err)
+			}
+			newPermissions = append(newPermissions, updated)
 		}
 	}
-
+	if err := session.Commit(); err != nil {
+		return rollback(err)
+	}
 	if len(newPermissions) == 0 {
 		return false, nil
 	}
-
-	err := updatePermissionsPolicies(oldPermissions, newPermissions)
-	if err != nil {
-		return false, err
-	}
-
 	return true, nil
 }
 
@@ -272,17 +535,32 @@ func AddPermission(permission *Permission) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
-	affected, err := ormer.Engine.Insert(permission)
-	if err != nil {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err = session.Begin(); err != nil {
 		return false, err
 	}
-
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err = lockPermissionGovernance(session, permission); err != nil {
+		return rollback(err)
+	}
+	if err = validatePermissionReferencesInSession(session, permission); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.Insert(permission)
+	if err != nil {
+		return rollback(err)
+	}
 	if affected != 0 {
-		err = addPolicies(permission)
-		if err != nil {
-			return false, err
+		if err = addPermissionPoliciesInSession(session, permission); err != nil {
+			return rollback(err)
 		}
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
 	}
 
 	return affected != 0, nil
@@ -292,22 +570,45 @@ func AddPermissions(permissions []*Permission) (bool, error) {
 	if len(permissions) == 0 {
 		return false, nil
 	}
-
-	affected, err := ormer.Engine.Insert(permissions)
-	if err != nil {
-		if !strings.Contains(err.Error(), "Duplicate entry") {
+	for _, permission := range permissions {
+		if err := checkPermissionValid(permission); err != nil {
 			return false, err
 		}
 	}
-
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockPermissionGovernance(session, permissions...); err != nil {
+		return rollback(err)
+	}
 	for _, permission := range permissions {
-		// add using for loop
-		if affected != 0 {
-			err = addPolicies(permission)
-			if err != nil {
-				return false, err
+		if err := validatePermissionReferencesInSession(session, permission); err != nil {
+			return rollback(err)
+		}
+	}
+	affected, err := session.Insert(permissions)
+	if err != nil {
+		_ = session.Rollback()
+		if strings.Contains(err.Error(), "Duplicate entry") || strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+			return false, nil
+		}
+		return false, err
+	}
+	if affected != 0 {
+		for _, permission := range permissions {
+			if err = addPermissionPoliciesInSession(session, permission); err != nil {
+				return rollback(err)
 			}
 		}
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
 	}
 	return affected != 0, nil
 }
@@ -344,37 +645,64 @@ func AddPermissionsInBatch(permissions []*Permission) (bool, error) {
 }
 
 func deletePermission(permission *Permission) (bool, error) {
-	affected, err := ormer.Engine.ID(core.PK{permission.Owner, permission.Name}).Delete(&Permission{})
-	if err != nil {
-		return false, err
-	}
+	affected, _, err := deletePermissionRecord(permission)
+	return affected, err
+}
 
-	return affected != 0, nil
+func deletePermissionRecord(permission *Permission) (bool, *Permission, error) {
+	snapshot, err := getPermission(permission.Owner, permission.Name)
+	if err != nil {
+		return false, nil, err
+	}
+	if snapshot == nil {
+		return false, nil, nil
+	}
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, nil, err
+	}
+	rollback := func(err error) (bool, *Permission, error) {
+		_ = session.Rollback()
+		return false, nil, err
+	}
+	if err := lockPermissionGovernance(session, snapshot); err != nil {
+		return rollback(err)
+	}
+	stored := &Permission{Owner: permission.Owner, Name: permission.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed {
+		_ = session.Rollback()
+		return false, nil, nil
+	}
+	covered, err := permissionGovernanceLocksCover([]*Permission{snapshot}, stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !covered {
+		return rollback(fmt.Errorf("the permission governance references changed while deleting it: %s", stored.GetId()))
+	}
+	if err = removePermissionPoliciesInSession(session, stored); err != nil {
+		return rollback(err)
+	}
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Delete(&Permission{})
+	if err != nil {
+		return rollback(err)
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	return affected != 0, stored, nil
 }
 
 func DeletePermission(permission *Permission) (bool, error) {
-	affected, err := deletePermission(permission)
+	affected, _, err := deletePermissionRecord(permission)
 	if err != nil {
 		return false, err
 	}
-
-	if affected {
-		err = removePolicies(permission)
-		if err != nil {
-			return false, err
-		}
-
-		// if permission.Adapter != "" && permission.Adapter != "permission_rule" {
-		// 	isEmpty, _ := ormer.Engine.IsTableEmpty(permission.Adapter)
-		// 	if isEmpty {
-		// 		err = ormer.Engine.DropTables(permission.Adapter)
-		// 		if err != nil {
-		// 			return false, err
-		// 		}
-		// 	}
-		// }
-	}
-
 	return affected, nil
 }
 

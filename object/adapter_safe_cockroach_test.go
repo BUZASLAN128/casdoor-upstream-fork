@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/casbin/casbin/v2/model"
-	"github.com/xorm-io/xorm"
 	_ "github.com/lib/pq"
+	"github.com/xorm-io/xorm"
 )
 
 const (
@@ -213,6 +215,305 @@ func TestSafeAdapterCockroachRepeatedWritesPreserveCustomTable(t *testing.T) {
 		if !found {
 			t.Errorf("custom table is missing STRING-compatible policy column %s", name)
 		}
+	}
+
+	testCockroachPermissionLifecycle(t, engine)
+	testCockroachSubscriptionRetry(t, engine)
+}
+
+func testCockroachPermissionLifecycle(t *testing.T, engine *xorm.Engine) {
+	t.Helper()
+	permissionTables := []string{
+		"tenant_permission_rule", "permission_rule", "permission", "adapter", "role", "group", "user", "organization",
+		"application", "privileged_account", "privileged_request", "subscription", "key", "resource", "pricing", "coupon",
+		"token", "third_party_link", "password_history", "syncer", "cert_login_ticket", "verification_record", "magic_link",
+	}
+	t.Cleanup(func() {
+		for _, table := range permissionTables {
+			if _, err := engine.Exec(`DROP TABLE IF EXISTS "` + table + `"`); err != nil {
+				t.Errorf("drop owned permission lifecycle table %s: %v", table, err)
+			}
+		}
+	})
+	if err := engine.Sync2(
+		&Organization{}, &User{}, &Permission{}, &Adapter{}, &Role{}, &Group{}, &Application{},
+		&PrivilegedAccount{}, &PrivilegedRequest{}, &Subscription{}, &Key{}, &Resource{}, &Pricing{}, &Coupon{},
+		&Token{}, &ThirdPartyLink{}, &PasswordHistory{}, &Syncer{}, &CertLoginTicket{}, &VerificationRecord{}, &MagicLink{},
+	); err != nil {
+		t.Fatalf("create permission lifecycle schema: %v", err)
+	}
+	if err := ensurePermissionPolicyTable(engine, "permission_rule"); err != nil {
+		t.Fatalf("create permission policy table: %v", err)
+	}
+	if err := ensurePermissionPolicyTable(engine, "permission_rule"); err != nil {
+		t.Fatalf("repeat permission policy startup check: %v", err)
+	}
+	previousOrmer := ormer
+	ormer = &Ormer{Engine: engine}
+	t.Cleanup(func() { ormer = previousOrmer })
+
+	for _, object := range []any{
+		&Organization{Owner: "admin", Name: "tenant"},
+		&User{Owner: "tenant", Name: "old"},
+		&User{Owner: "tenant", Name: "fail"},
+	} {
+		if _, err := engine.Insert(object); err != nil {
+			t.Fatalf("seed permission lifecycle %T: %v", object, err)
+		}
+	}
+	permission := &Permission{
+		Owner:     "tenant",
+		Name:      "cockroach-lifecycle",
+		Users:     []string{"tenant/old"},
+		Resources: []string{"resource"},
+		Actions:   []string{"read"},
+		Effect:    "Allow",
+		IsEnabled: true,
+	}
+	if added, err := AddPermission(permission); err != nil || !added {
+		t.Fatalf("add Cockroach permission = (%v, %v)", added, err)
+	}
+	assertCockroachPermissionState(t, engine, permission.GetId(), "tenant/old", true)
+
+	if _, err := engine.Exec("ALTER TABLE permission_rule ADD CONSTRAINT reject_failed_policy CHECK (v0 != 'tenant/fail')"); err != nil {
+		t.Fatalf("install injected policy failure: %v", err)
+	}
+	failedUpdate := *permission
+	failedUpdate.Users = []string{"tenant/fail"}
+	if updated, err := UpdatePermission(permission.GetId(), &failedUpdate); err == nil || updated {
+		t.Fatalf("policy-write failure update = (%v, %v), want rollback", updated, err)
+	}
+	assertCockroachPermissionState(t, engine, permission.GetId(), "tenant/old", true)
+
+	stored := &Permission{Owner: permission.Owner, Name: permission.Name}
+	if existed, err := engine.Get(stored); err != nil || !existed {
+		t.Fatalf("read Cockroach permission = (%v, %v)", existed, err)
+	}
+	stored.ExpireTime = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	if updated, err := UpdatePermission(stored.GetId(), stored); err != nil || !updated {
+		t.Fatalf("set Cockroach permission expiry = (%v, %v)", updated, err)
+	}
+	if revoked, err := expirePermissionInTransaction(stored, time.Now().UTC()); err != nil || !revoked {
+		t.Fatalf("expire Cockroach permission = (%v, %v)", revoked, err)
+	}
+	assertCockroachPermissionState(t, engine, permission.GetId(), "", false)
+
+	adapter := &Adapter{Owner: "tenant", Name: "custom-permission", Table: "tenant_permission_rule", UseSameDb: true}
+	if added, err := AddAdapter(adapter); err != nil || !added {
+		t.Fatalf("add Cockroach custom permission adapter = (%v, %v)", added, err)
+	}
+	if err := ensureStoredPermissionPolicyTables(engine); err != nil {
+		t.Fatalf("repeat Cockroach custom table startup provisioning: %v", err)
+	}
+	customPermission := &Permission{
+		Owner:     "tenant",
+		Name:      "cockroach-custom-adapter",
+		Adapter:   adapter.Name,
+		Users:     []string{"tenant/old"},
+		Resources: []string{"resource"},
+		Actions:   []string{"read"},
+		Effect:    "Allow",
+		IsEnabled: true,
+	}
+	if added, err := AddPermission(customPermission); err != nil || !added {
+		t.Fatalf("add Cockroach custom-adapter permission = (%v, %v)", added, err)
+	}
+	customPolicyCount := struct {
+		Count int64 `xorm:"count"`
+	}{}
+	if _, err := engine.SQL("SELECT count(*) AS count FROM tenant_permission_rule WHERE ptype = ? AND v5 = ?", "p", customPermission.GetId()).Get(&customPolicyCount); err != nil {
+		t.Fatalf("count Cockroach custom permission policies: %v", err)
+	}
+	if customPolicyCount.Count != 1 {
+		t.Fatalf("Cockroach custom permission policy count = %d, want one", customPolicyCount.Count)
+	}
+	if deleted, err := deleteUser(&User{Owner: "tenant", Name: "old"}); err == nil || deleted {
+		t.Fatalf("delete Cockroach permission-bound user = (%v, %v), want refusal", deleted, err)
+	}
+	if deleted, err := DeletePermission(customPermission); err != nil || !deleted {
+		t.Fatalf("delete Cockroach custom permission = (%v, %v)", deleted, err)
+	}
+	if deleted, err := DeletePermission(stored); err != nil || !deleted {
+		t.Fatalf("delete Cockroach expired permission = (%v, %v)", deleted, err)
+	}
+	application := &Application{Owner: "admin", Name: "cockroach-external", ExternalUsers: []string{"tenant/reserved"}}
+	if _, err := engine.Insert(application); err != nil {
+		t.Fatalf("insert Cockroach reserved external identity: %v", err)
+	}
+	oldUser := &User{Owner: "tenant", Name: "old"}
+	if existed, err := engine.Get(oldUser); err != nil || !existed {
+		t.Fatalf("read Cockroach rename source = (%v, %v)", existed, err)
+	}
+	renamed := *oldUser
+	renamed.Name = "reserved"
+	if updated, err := UpdateUser("tenant/old", &renamed, []string{"name"}, true); err == nil || updated {
+		t.Fatalf("rename Cockroach user into reserved identity = (%v, %v), want refusal", updated, err)
+	}
+	if existed, err := engine.Get(&User{Owner: "tenant", Name: "old"}); err != nil || !existed {
+		t.Fatalf("Cockroach rename source survived refusal = (%v, %v), want true", existed, err)
+	}
+	if existed, err := engine.Get(&User{Owner: "tenant", Name: "reserved"}); err != nil || existed {
+		t.Fatalf("Cockroach reserved rename destination exists = (%v, %v), want false", existed, err)
+	}
+	rollbackRole := &Role{Owner: "tenant", Name: "cockroach-rollback-role", Users: []string{"tenant/old"}}
+	rollbackResource := &Resource{Owner: "tenant", Name: "/cockroach-rollback", User: "old"}
+	if _, err := engine.Insert(rollbackRole, rollbackResource); err != nil {
+		t.Fatalf("insert Cockroach rename rollback references: %v", err)
+	}
+	if _, err := engine.Exec(`ALTER TABLE "user" ADD CONSTRAINT reject_blocked_user_rename CHECK (name != 'blocked')`); err != nil {
+		t.Fatalf("install Cockroach user rename failure: %v", err)
+	}
+	blockedRename := *oldUser
+	blockedRename.Name = "blocked"
+	if updated, err := UpdateUser("tenant/old", &blockedRename, []string{"name"}, true); err == nil || updated {
+		t.Fatalf("injected-failure Cockroach rename = (%v, %v), want rollback", updated, err)
+	}
+	if existed, err := engine.Get(&User{Owner: "tenant", Name: "old"}); err != nil || !existed {
+		t.Fatalf("Cockroach rename source after rollback = (%v, %v), want true", existed, err)
+	}
+	storedRollbackRole := &Role{Owner: rollbackRole.Owner, Name: rollbackRole.Name}
+	if existed, err := engine.Get(storedRollbackRole); err != nil || !existed {
+		t.Fatalf("read Cockroach role after rename rollback = (%v, %v)", existed, err)
+	}
+	if len(storedRollbackRole.Users) != 1 || storedRollbackRole.Users[0] != "tenant/old" {
+		t.Fatalf("Cockroach role users after rename rollback = %v, want [tenant/old]", storedRollbackRole.Users)
+	}
+	storedRollbackResource := &Resource{Owner: rollbackResource.Owner, Name: rollbackResource.Name}
+	if existed, err := engine.Get(storedRollbackResource); err != nil || !existed {
+		t.Fatalf("read Cockroach resource after rename rollback = (%v, %v)", existed, err)
+	}
+	if storedRollbackResource.User != "old" {
+		t.Fatalf("Cockroach resource user after rename rollback = %q, want old", storedRollbackResource.User)
+	}
+	if _, err := engine.Delete(rollbackRole); err != nil {
+		t.Fatalf("delete Cockroach rollback role: %v", err)
+	}
+	if _, err := engine.Delete(rollbackResource); err != nil {
+		t.Fatalf("delete Cockroach rollback resource: %v", err)
+	}
+	role := &Role{Owner: "tenant", Name: "cockroach-role", Users: []string{"tenant/old"}}
+	if _, err := engine.Insert(role); err != nil {
+		t.Fatalf("insert Cockroach user role: %v", err)
+	}
+	if deleted, err := deleteUser(&User{Owner: "tenant", Name: "old"}); err == nil || deleted {
+		t.Fatalf("delete Cockroach role-bound user = (%v, %v), want refusal", deleted, err)
+	}
+	if _, err := engine.Delete(role); err != nil {
+		t.Fatalf("delete Cockroach user role: %v", err)
+	}
+	subscription := &Subscription{Owner: "tenant", Name: "cockroach-subscription", User: "old", State: SubStateExpired}
+	if _, err := engine.Insert(subscription); err != nil {
+		t.Fatalf("insert Cockroach user subscription: %v", err)
+	}
+	if deleted, err := deleteUser(&User{Owner: "tenant", Name: "old"}); err == nil || deleted {
+		t.Fatalf("delete Cockroach subscription-bound user = (%v, %v), want refusal", deleted, err)
+	}
+	if _, err := engine.Delete(subscription); err != nil {
+		t.Fatalf("delete Cockroach user subscription: %v", err)
+	}
+	if deleted, err := deleteUser(&User{Owner: "tenant", Name: "old"}); err != nil || !deleted {
+		t.Fatalf("delete Cockroach unbound user = (%v, %v), want success", deleted, err)
+	}
+	if _, err := engine.Insert(&User{Owner: "tenant", Name: "old"}); err != nil {
+		t.Fatalf("recreate Cockroach unbound user: %v", err)
+	}
+}
+
+func assertCockroachPermissionState(t *testing.T, engine *xorm.Engine, permissionId string, policySubject string, enabled bool) {
+	t.Helper()
+	stored := &Permission{Owner: "tenant", Name: "cockroach-lifecycle"}
+	existed, err := engine.Get(stored)
+	if err != nil || !existed {
+		t.Fatalf("read permission state = (%v, %v)", existed, err)
+	}
+	if stored.IsEnabled != enabled {
+		t.Fatalf("permission enabled = %v, want %v", stored.IsEnabled, enabled)
+	}
+	if enabled && (len(stored.Users) != 1 || stored.Users[0] != policySubject) {
+		t.Fatalf("permission users = %v, want [%s]", stored.Users, policySubject)
+	}
+	rules := []*safeCasbinRule{}
+	if err := engine.Table("permission_rule").Where("ptype = ? AND v5 = ?", "p", permissionId).Find(&rules); err != nil {
+		t.Fatalf("read permission policy state: %v", err)
+	}
+	if policySubject == "" {
+		if len(rules) != 0 {
+			t.Fatalf("expired permission retained policies: %#v", rules)
+		}
+		return
+	}
+	if len(rules) != 1 || rules[0].V0 != policySubject {
+		t.Fatalf("permission policy rows = %#v, want one subject %s", rules, policySubject)
+	}
+}
+
+func testCockroachSubscriptionRetry(t *testing.T, engine *xorm.Engine) {
+	t.Helper()
+	const tableName = "subscription_retry_probe"
+	if _, err := engine.Exec("CREATE TABLE " + tableName + " (id INT8 PRIMARY KEY, value INT8 NOT NULL)"); err != nil {
+		t.Fatalf("create Cockroach retry probe: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := engine.Exec("DROP TABLE IF EXISTS " + tableName); err != nil {
+			t.Errorf("drop Cockroach retry probe: %v", err)
+		}
+	})
+	if _, err := engine.Exec("INSERT INTO " + tableName + " (id, value) VALUES (1, 0)"); err != nil {
+		t.Fatalf("seed Cockroach retry probe: %v", err)
+	}
+
+	attempts := 0
+	err := retrySubscriptionTransaction(func() error {
+		attempts++
+		session := engine.NewSession()
+		defer session.Close()
+		if err := session.Begin(); err != nil {
+			return err
+		}
+		rows, err := session.QueryString("SELECT value FROM " + tableName + " WHERE id = 1")
+		if err != nil {
+			_ = session.Rollback()
+			return err
+		}
+		if len(rows) != 1 {
+			_ = session.Rollback()
+			return fmt.Errorf("retry probe returned %d rows", len(rows))
+		}
+		value, err := strconv.ParseInt(rows[0]["value"], 10, 64)
+		if err != nil {
+			_ = session.Rollback()
+			return err
+		}
+		if attempts == 1 {
+			if _, err = engine.Exec("UPDATE " + tableName + " SET value = value + 1 WHERE id = 1"); err != nil {
+				_ = session.Rollback()
+				return err
+			}
+		}
+		if _, err = session.Exec("UPDATE "+tableName+" SET value = ? WHERE id = 1", value+10); err != nil {
+			_ = session.Rollback()
+			return err
+		}
+		if err = session.Commit(); err != nil {
+			_ = session.Rollback()
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry genuine Cockroach serialization failure after %d attempts: %v", attempts, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("genuine Cockroach retry attempts = %d, want 2", attempts)
+	}
+	result := struct {
+		Value int64 `xorm:"value"`
+	}{}
+	if _, err := engine.SQL("SELECT value FROM " + tableName + " WHERE id = 1").Get(&result); err != nil {
+		t.Fatalf("read Cockroach retry result: %v", err)
+	}
+	if result.Value != 11 {
+		t.Fatalf("Cockroach retry result = %d, want 11", result.Value)
 	}
 }
 

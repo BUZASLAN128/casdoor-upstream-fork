@@ -15,6 +15,7 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -56,27 +57,71 @@ func ExpirePermissions() error {
 	}
 
 	revokedCount := 0
+	revocationErrors := []error{}
 	for _, permission := range permissions {
 		if !isPermissionExpired(permission, now) {
 			continue
 		}
-
-		err = removePolicies(permission)
-		if err != nil {
-			return fmt.Errorf("failed to remove policies for expired permission %s: %w", permission.GetId(), err)
+		revoked, revokeErr := expirePermissionInTransaction(permission, now)
+		if revokeErr != nil {
+			revocationErrors = append(revocationErrors, fmt.Errorf("failed to revoke expired permission %s: %w", permission.GetId(), revokeErr))
+			continue
 		}
-
+		if !revoked {
+			continue
+		}
 		permission.IsEnabled = false
-		_, err = ormer.Engine.ID(core.PK{permission.Owner, permission.Name}).Cols("is_enabled").Update(permission)
-		if err != nil {
-			return fmt.Errorf("failed to disable expired permission %s: %w", permission.GetId(), err)
-		}
-
 		fmt.Printf("[%d] Revoked expired permission: %s | ExpireTime: %s\n", revokedCount, permission.GetId(), permission.ExpireTime)
 		revokedCount++
 	}
 
-	return nil
+	return errors.Join(revocationErrors...)
+}
+
+func expirePermissionInTransaction(permission *Permission, now time.Time) (bool, error) {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+	rollback := func(err error) (bool, error) {
+		_ = session.Rollback()
+		return false, err
+	}
+	if err := lockPermissionGovernance(session, permission); err != nil {
+		return rollback(err)
+	}
+	stored := &Permission{Owner: permission.Owner, Name: permission.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !existed || !stored.IsEnabled || !isPermissionExpired(stored, now) {
+		_ = session.Rollback()
+		return false, nil
+	}
+	covered, err := permissionGovernanceLocksCover([]*Permission{permission}, stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if !covered {
+		return rollback(fmt.Errorf("the permission governance references changed while expiring it: %s", stored.GetId()))
+	}
+	if err = removePermissionPoliciesInSession(session, stored); err != nil {
+		return rollback(err)
+	}
+	stored.IsEnabled = false
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Cols("is_enabled").Update(stored)
+	if err != nil {
+		return rollback(err)
+	}
+	if affected != 1 {
+		return rollback(fmt.Errorf("the permission changed while expiring it: %s", stored.GetId()))
+	}
+	if err = session.Commit(); err != nil {
+		return rollback(err)
+	}
+	return true, nil
 }
 
 // InitExpirePermissions runs the permission expiration job once at startup and then
