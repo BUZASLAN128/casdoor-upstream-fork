@@ -16,6 +16,7 @@ package object
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -43,19 +44,29 @@ func InitDPoPProofReplayStore() {
 	}
 
 	addrs := strings.Join(config.Addrs, ";")
-	client, err := newRedisClient(config)
+	store, err := newDPoPProofReplayStore(config, newRedisClient)
+	DPoPProofReplayStore = store
 	if err != nil {
-		logs.Warn("dpop_proof_store: failed to connect to Redis (%s), falling back to in-memory store: %v", addrs, err)
+		logs.Error("dpop_proof_store: failed to connect to configured Redis (%s); DPoP validation will fail closed: %v", addrs, err)
 		return
 	}
 
-	DPoPProofReplayStore = &redisDPoPProofReplayStore{client: client}
 	logs.Info("dpop_proof_store: using Redis backend at %s", addrs)
+}
+
+func newDPoPProofReplayStore(config *conf.RedisConfig, connect func(*conf.RedisConfig) (redis.Cmdable, error)) (dpopProofReplayStore, error) {
+	client, err := connect(config)
+	if err != nil {
+		wrapped := fmt.Errorf("configured Redis replay store is unavailable: %w", err)
+		return &unavailableDPoPProofReplayStore{err: wrapped}, wrapped
+	}
+	return &redisDPoPProofReplayStore{client: client}, nil
 }
 
 type memoryDPoPProofReplayStore struct {
 	mu       sync.Mutex
 	expiries map[string]time.Time
+	now      func() time.Time
 }
 
 func (s *memoryDPoPProofReplayStore) MarkUsed(id string, ttl time.Duration) (bool, error) {
@@ -63,6 +74,9 @@ func (s *memoryDPoPProofReplayStore) MarkUsed(id string, ttl time.Duration) (boo
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
 	for usedId, expiry := range s.expiries {
 		if !now.Before(expiry) {
 			delete(s.expiries, usedId)
@@ -73,6 +87,14 @@ func (s *memoryDPoPProofReplayStore) MarkUsed(id string, ttl time.Duration) (boo
 	}
 	s.expiries[id] = now.Add(ttl)
 	return false, nil
+}
+
+type unavailableDPoPProofReplayStore struct {
+	err error
+}
+
+func (s *unavailableDPoPProofReplayStore) MarkUsed(_ string, _ time.Duration) (bool, error) {
+	return false, s.err
 }
 
 type redisDPoPProofReplayStore struct {

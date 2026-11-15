@@ -51,6 +51,10 @@ type DPoPProofClaims struct {
 // On success it returns the base64url-encoded SHA-256 JWK thumbprint (jkt) of
 // the DPoP public key embedded in the proof header.
 func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, error) {
+	return validateDPoPProofAt(proofToken, method, htu, accessToken, time.Now())
+}
+
+func validateDPoPProofAt(proofToken, method, htu, accessToken string, now time.Time) (string, error) {
 	parts := strings.Split(proofToken, ".")
 	if len(parts) != 3 {
 		return "", fmt.Errorf("invalid DPoP proof JWT format")
@@ -128,7 +132,7 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 	if claims.IssuedAt == nil {
 		return "", fmt.Errorf("DPoP proof missing iat claim")
 	}
-	age := time.Since(claims.IssuedAt.Time).Abs()
+	age := now.Sub(claims.IssuedAt.Time).Abs()
 	if age > time.Duration(dpopMaxAgeSeconds)*time.Second {
 		return "", fmt.Errorf("DPoP proof iat is outside the acceptable time window (%d seconds)", dpopMaxAgeSeconds)
 	}
@@ -151,7 +155,16 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 	// A valid proof is single-use. Scope the replay key to the signing key so
 	// unrelated clients may choose the same jti, and hash it before persistence.
 	replayDigest := sha256.Sum256([]byte(jkt + "\x00" + claims.Jti))
-	replayed, err := DPoPProofReplayStore.MarkUsed(base64.RawURLEncoding.EncodeToString(replayDigest[:]), time.Duration(dpopMaxAgeSeconds)*time.Second)
+	// Keep the identifier until the proof is no longer acceptable. A proof may
+	// be dated up to dpopMaxAgeSeconds in the future, so a fixed max-age TTL from
+	// receipt would expire while that same proof was still valid. The extra
+	// second closes the inclusive validation boundary (age == max is valid).
+	replayExpiry := claims.IssuedAt.Time.Add(time.Duration(dpopMaxAgeSeconds+1) * time.Second)
+	replayTTL := replayExpiry.Sub(now)
+	if replayTTL <= 0 {
+		return "", fmt.Errorf("DPoP proof replay retention window has expired")
+	}
+	replayed, err := DPoPProofReplayStore.MarkUsed(base64.RawURLEncoding.EncodeToString(replayDigest[:]), replayTTL)
 	if err != nil {
 		return "", fmt.Errorf("failed to record DPoP proof identifier: %w", err)
 	}

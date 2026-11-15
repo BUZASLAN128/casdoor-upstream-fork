@@ -278,29 +278,25 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 		} else if nonce == "" && responseType.IsNonceRequired(scope) {
 			resp = &Response{Status: "error", Msg: c.T("token:The nonce parameter is required for this response type"), Data: ""}
 		} else {
-			consentRequired, err := object.CheckConsentRequired(user, application, scope)
+			resolvedScope, valid, consentRequired, err := object.ResolveImplicitScope(user, application, scope)
 			if err != nil {
 				c.ResponseError(err.Error())
 				return
 			}
-			if consentRequired {
+			if !valid {
+				resp = &Response{Status: "error", Msg: "error: invalid_scope", Data: ""}
+			} else if consentRequired {
 				resp = &Response{Status: "error", Msg: "error: consent_required; use the authorization code flow for custom scopes", Data: ""}
 			} else {
-				scope = object.GetConsentedScope(user, application, scope)
-				expandedScope, valid := object.IsScopeValidAndExpand(scope, application)
-				if !valid {
-					resp = &Response{Status: "error", Msg: "error: invalid_scope", Data: ""}
-				} else {
-					token, err := object.GetTokenByUserWithAuth(application, user, expandedScope, nonce, c.Ctx.Input.CruSession.SessionID(context.Background()), c.Ctx.Request.Host, authTime, responseType.Token && responseType.IdToken, "")
-					if err != nil {
-						c.ResponseError(err.Error(), nil)
-						return
-					}
-					resp = tokenToResponse(token)
+				token, err := object.GetTokenByUserWithAuth(application, user, resolvedScope, nonce, c.Ctx.Input.CruSession.SessionID(context.Background()), c.Ctx.Request.Host, authTime, responseType.Token && responseType.IdToken, "")
+				if err != nil {
+					c.ResponseError(err.Error(), nil)
+					return
+				}
+				resp = tokenToResponse(token)
 
-					if application.EnableSigninSession || application.HasPromptPage() {
-						c.SetSessionUsername(userId)
-					}
+				if application.EnableSigninSession || application.HasPromptPage() {
+					c.SetSessionUsername(userId)
 				}
 			}
 		}

@@ -222,6 +222,27 @@ func GetConsentedScope(userObj *User, application *Application, scopeStr string)
 	return strings.Join(res, " ")
 }
 
+// ResolveImplicitScope validates and expands the requested scopes before applying
+// custom-scope consent. Consent decisions must operate on the expanded scope set;
+// otherwise a regular-expression request can introduce custom scopes after the
+// consent check has already completed.
+func ResolveImplicitScope(userObj *User, application *Application, scopeStr string) (string, bool, bool, error) {
+	expandedScope, valid := IsScopeValidAndExpand(scopeStr, application)
+	if !valid {
+		return "", false, false, nil
+	}
+
+	consentRequired, err := CheckConsentRequired(userObj, application, expandedScope)
+	if err != nil {
+		return "", true, false, err
+	}
+	if consentRequired {
+		return "", true, true, nil
+	}
+
+	return GetConsentedScope(userObj, application, expandedScope), true, false, nil
+}
+
 func validateCustomScopes(customScopes []*ScopeDescription, lang string) error {
 	for _, scope := range customScopes {
 		if scope == nil || strings.TrimSpace(scope.Scope) == "" {
