@@ -1,0 +1,60 @@
+package object
+
+import (
+	"testing"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestCerberusSecurityTokenExchangeRejectsSenderConstrainedSubjects(t *testing.T) {
+	tests := []struct {
+		name   string
+		record *Token
+	}{
+		{
+			name:   "complete DPoP binding",
+			record: &Token{AccessToken: "bound-subject", TokenType: "DPoP", DPoPJkt: "bound-key"},
+		},
+		{
+			name:   "binding metadata without token type",
+			record: &Token{AccessToken: "bound-subject", TokenType: "Bearer", DPoPJkt: "bound-key"},
+		},
+		{
+			name:   "DPoP token type without binding metadata",
+			record: &Token{AccessToken: "bound-subject", TokenType: "DPoP"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenError := validateTokenExchangeSubjectBinding(tt.record, tt.record.AccessToken)
+			if tokenError == nil || tokenError.Error != InvalidGrant {
+				t.Fatalf("sender-constrained subject error = %#v, want invalid_grant", tokenError)
+			}
+		})
+	}
+}
+
+func TestCerberusSecurityTokenExchangePreservesBearerAndIdTokenFlows(t *testing.T) {
+	bearerRecord := &Token{AccessToken: "bearer-subject", TokenType: "Bearer"}
+	if tokenError := validateTokenExchangeSubjectBinding(bearerRecord, bearerRecord.AccessToken); tokenError != nil {
+		t.Fatalf("bearer subject token was rejected: %#v", tokenError)
+	}
+
+	dpopRecord := &Token{AccessToken: "dpop-access", IdToken: "subject-id-token", TokenType: "DPoP", DPoPJkt: "bound-key"}
+	if tokenError := validateTokenExchangeSubjectBinding(dpopRecord, dpopRecord.IdToken); tokenError != nil {
+		t.Fatalf("ID token exchange was treated as DPoP access-token exchange: %#v", tokenError)
+	}
+}
+
+func TestCerberusSecurityFederatedTokenExchangeRejectsConfirmationClaims(t *testing.T) {
+	if !hasSenderConstrainedConfirmation(jwt.MapClaims{"cnf": map[string]any{"jkt": "bound-key"}}) {
+		t.Fatal("sender-constrained federated claims were not detected")
+	}
+	if !hasSenderConstrainedConfirmation(jwt.MapClaims{"cnf": map[string]any{}}) {
+		t.Fatal("malformed empty confirmation claim was accepted as unbound")
+	}
+	if hasSenderConstrainedConfirmation(jwt.MapClaims{"sub": "unbound-subject"}) {
+		t.Fatal("unbound federated claims were treated as sender constrained")
+	}
+}

@@ -78,6 +78,12 @@ type LaravelResponse struct {
 	UpdatedAt       string `json:"updated_at"`
 }
 
+func isSignupOAuthApplication(signupApplication *object.Application, targetApplication *object.Application, clientId string) bool {
+	return signupApplication != nil && targetApplication != nil &&
+		targetApplication.GetId() == signupApplication.GetId() &&
+		targetApplication.ClientId == clientId
+}
+
 // Signup
 // @Tag Login API
 // @Title Signup
@@ -113,6 +119,21 @@ func (c *ApiController) Signup() {
 	if !application.IsSelfSignupEnabled() && authForm.InvitationCode == "" {
 		c.ResponseError(c.T("account:The application does not allow to sign up new account"))
 		return
+	}
+
+	clientId := c.Ctx.Input.Query("clientId")
+	responseType := c.Ctx.Input.Query("responseType")
+	var codeApplication *object.Application
+	if clientId != "" && responseType == ResponseTypeCode {
+		codeApplication, err = object.GetApplicationByClientId(clientId)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if !isSignupOAuthApplication(application, codeApplication, clientId) {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
+			return
+		}
 	}
 
 	organization, err := object.GetOrganization(util.GetId("admin", authForm.Organization))
@@ -317,6 +338,9 @@ func (c *ApiController) Signup() {
 			return
 		}
 	}
+	if codeApplication != nil && (!c.checkApplicationSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication)) {
+		return
+	}
 
 	if user.Type == "normal-user" {
 		c.renewSessionIdForUser(user.GetId())
@@ -348,8 +372,6 @@ func (c *ApiController) Signup() {
 	util.LogInfo(c.Ctx, "API: [%s] is signed up as new user", userId)
 
 	// Check if this is an OAuth flow and automatically generate code
-	clientId := c.Ctx.Input.Query("clientId")
-	responseType := c.Ctx.Input.Query("responseType")
 	redirectUri := c.Ctx.Input.Query("redirectUri")
 	scope := c.Ctx.Input.Query("scope")
 	state := c.Ctx.Input.Query("state")
@@ -364,7 +386,7 @@ func (c *ApiController) Signup() {
 
 	// If OAuth parameters are present, generate OAuth code and return it
 	if clientId != "" && responseType == ResponseTypeCode && !isSigninPending {
-		consentRequired, err := object.CheckConsentRequired(user, application, scope)
+		consentRequired, err := object.CheckConsentRequired(user, codeApplication, scope)
 		if err != nil {
 			c.ResponseError(err.Error())
 			return
@@ -375,7 +397,7 @@ func (c *ApiController) Signup() {
 			return
 		}
 
-		code, err := object.GetOAuthCode(userId, clientId, "", "password", responseType, redirectUri, scope, state, nonce, codeChallenge, "", c.Ctx.Input.CruSession.SessionID(context.Background()), time.Now().Unix(), c.Ctx.Request.Host, c.GetAcceptLanguage())
+		code, err := object.GetOAuthCode(userId, codeApplication.ClientId, "", "password", responseType, redirectUri, scope, state, nonce, codeChallenge, "", c.Ctx.Input.CruSession.SessionID(context.Background()), time.Now().Unix(), c.Ctx.Request.Host, c.GetAcceptLanguage())
 		if err != nil {
 			c.ResponseError(err.Error(), nil)
 			return

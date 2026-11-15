@@ -70,5 +70,8 @@ func (c *ApiController) verifyMfaPasscode(user *object.User, mfaUtil object.MfaI
 	if err != nil || passed {
 		return err
 	}
+	if pushMfa, ok := mfaUtil.(*object.PushMfa); ok {
+		pushMfa.BindUser(user.GetId())
+	}
 	return mfaUtil.Verify(passcode, c.GetAcceptLanguage())
 }

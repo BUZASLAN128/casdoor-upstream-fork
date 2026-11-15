@@ -176,6 +176,9 @@ func (c *ApiController) MfaSetupVerify() {
 		c.ResponseError("User doesn't exist")
 		return
 	}
+	if pushMfa, ok := mfaUtil.(*object.PushMfa); ok {
+		pushMfa.BindUser(user.GetId())
+	}
 
 	verifiedDest := getMfaSetupDest(mfaType, dest, countryCode)
 	err = object.VerifyMfaWithLimit(user, func() error { return mfaUtil.SetupVerify(passcode, c.GetAcceptLanguage()) }, c.GetAcceptLanguage())

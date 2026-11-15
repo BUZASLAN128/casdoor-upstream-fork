@@ -839,6 +839,11 @@ func GetWechatMiniProgramToken(application *Application, code string, phoneCode 
 
 // GetTokenExchangeToken handles the Token Exchange Grant flow (RFC 8693).
 // Exchanges a subject token for a new token with different audience or scope.
+func hasSenderConstrainedConfirmation(claims jwt.MapClaims) bool {
+	_, ok := claims["cnf"]
+	return ok
+}
+
 func GetTokenExchangeToken(application *Application, clientSecret string, subjectToken string, subjectTokenType string, audience string, scope string, host string) (*Token, *TokenError, error) {
 	credential, federatedClaims, err := validateFederatedToken(application, subjectToken, host)
 	if err != nil {
@@ -848,6 +853,12 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		}, nil
 	}
 	if credential != nil {
+		if hasSenderConstrainedConfirmation(federatedClaims) {
+			return nil, &TokenError{
+				Error:            InvalidGrant,
+				ErrorDescription: "exchange of sender-constrained subject tokens is not supported",
+			}, nil
+		}
 		return getFederatedTokenExchangeToken(application, credential, federatedClaims, audience, scope, host)
 	}
 
@@ -996,6 +1007,20 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 	return token, nil, nil
 }
 
+func validateTokenExchangeSubjectBinding(subjectTokenRecord *Token, subjectToken string) *TokenError {
+	if subjectTokenRecord == nil || subjectToken != subjectTokenRecord.AccessToken {
+		return nil
+	}
+
+	if subjectTokenRecord.DPoPJkt == "" && subjectTokenRecord.TokenType != "DPoP" {
+		return nil
+	}
+	return &TokenError{
+		Error:            InvalidGrant,
+		ErrorDescription: "exchange of sender-constrained subject tokens is not supported",
+	}
+}
+
 // getSubjectTokenUser returns the user of an active subject token issued by Casdoor to the application, and the token's scope
 func getSubjectTokenUser(application *Application, subjectToken string, subjectTokenType string) (*User, string, *TokenError, error) {
 	subjectOwner, subjectName, subjectScope, tokenError, err := parseAndValidateSubjectToken(subjectToken, application.ClientId)
@@ -1019,6 +1044,9 @@ func getSubjectTokenUser(application *Application, subjectToken string, subjectT
 			Error:            InvalidGrant,
 			ErrorDescription: "subject_token is revoked or unknown",
 		}, nil
+	}
+	if tokenError := validateTokenExchangeSubjectBinding(subjectTokenRecord, subjectToken); tokenError != nil {
+		return nil, "", tokenError, nil
 	}
 
 	user, err := getUser(subjectOwner, subjectName)

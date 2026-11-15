@@ -29,13 +29,19 @@ type PushMfa struct {
 	provider     *Provider
 	challengeId  string
 	challengeExp time.Time
+	userId       string
 }
 
 func (mfa *PushMfa) Initiate(userId string, issuer string) (*MfaProps, error) {
+	mfa.userId = userId
 	mfaProps := MfaProps{
 		MfaType: mfa.MfaType,
 	}
 	return &mfaProps, nil
+}
+
+func (mfa *PushMfa) BindUser(userId string) {
+	mfa.userId = userId
 }
 
 func (mfa *PushMfa) SetupVerify(passCode string, lang string) error {
@@ -48,7 +54,7 @@ func (mfa *PushMfa) SetupVerify(passCode string, lang string) error {
 	}
 
 	// the passcode is the id of the sign-in request that the user approved on the phone
-	return consumePushChallenge(passCode, mfa.URL, mfa.Secret)
+	return consumePushChallenge(passCode, mfa.userId, mfa.URL, mfa.Secret)
 }
 
 func (mfa *PushMfa) Enable(user *User) error {
@@ -84,7 +90,7 @@ func (mfa *PushMfa) Verify(passCode string, lang string) error {
 		return errors.New("push notification provider is not configured")
 	}
 
-	return consumePushChallenge(passCode, mfa.URL, mfa.Secret)
+	return consumePushChallenge(passCode, mfa.userId, mfa.URL, mfa.Secret)
 }
 
 func (mfa *PushMfa) sendPushNotification(title string, message string) error {

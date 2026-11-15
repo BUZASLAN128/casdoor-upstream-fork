@@ -32,40 +32,75 @@ const (
 	PushChallengeApproved = "Approved"
 	PushChallengeDenied   = "Denied"
 	PushChallengeExpired  = "Expired"
+	pushChallengeConsumed = "Consumed"
 
 	pushChallengeLifetime = 5 * time.Minute
 )
 
 // PushChallenge is a sign-in waiting for the user to confirm it on the phone
 type PushChallenge struct {
-	Id          string    `json:"id"`
-	UserId      string    `json:"userId"`
-	Provider    string    `json:"-"`
-	Receiver    string    `json:"-"`
-	Application string    `json:"application"`
-	Ip          string    `json:"ip"`
-	Location    string    `json:"location"`
-	UserAgent   string    `json:"userAgent"`
-	Status      string    `json:"status"`
-	CreatedTime time.Time `json:"createdTime"`
+	Id            string    `json:"id"`
+	ApprovalToken string    `json:"-"`
+	UserId        string    `json:"userId"`
+	Provider      string    `json:"-"`
+	Receiver      string    `json:"-"`
+	Application   string    `json:"application"`
+	Ip            string    `json:"ip"`
+	Location      string    `json:"location"`
+	UserAgent     string    `json:"userAgent"`
+	Status        string    `json:"status"`
+	CreatedTime   time.Time `json:"createdTime"`
+	mu            sync.Mutex
 }
 
 var pushChallenges sync.Map
+var pushChallengeApprovals sync.Map
+
+func deletePushChallenge(challenge *PushChallenge) {
+	if challenge == nil {
+		return
+	}
+	pushChallenges.Delete(challenge.Id)
+	pushChallengeApprovals.Delete(challenge.ApprovalToken)
+}
 
 func getPushChallenge(id string) *PushChallenge {
 	value, ok := pushChallenges.Load(id)
 	if !ok {
-		return nil
+		challengeId, approvalOk := pushChallengeApprovals.Load(id)
+		if !approvalOk {
+			return nil
+		}
+		value, ok = pushChallenges.Load(challengeId.(string))
+		if !ok {
+			pushChallengeApprovals.Delete(id)
+			return nil
+		}
 	}
 	challenge := value.(*PushChallenge)
-	if challenge.Status == PushChallengePending && time.Since(challenge.CreatedTime) > pushChallengeLifetime {
+	challenge.mu.Lock()
+	defer challenge.mu.Unlock()
+	if (challenge.Status == PushChallengePending || challenge.Status == PushChallengeApproved) && time.Since(challenge.CreatedTime) > pushChallengeLifetime {
 		challenge.Status = PushChallengeExpired
 	}
 	if time.Since(challenge.CreatedTime) > 2*pushChallengeLifetime {
-		pushChallenges.Delete(id)
+		deletePushChallenge(challenge)
 		return nil
 	}
 	return challenge
+}
+
+func copyPushChallengeLocked(challenge *PushChallenge) *PushChallenge {
+	return &PushChallenge{
+		Id:          challenge.Id,
+		UserId:      challenge.UserId,
+		Application: challenge.Application,
+		Ip:          challenge.Ip,
+		Location:    challenge.Location,
+		UserAgent:   challenge.UserAgent,
+		Status:      challenge.Status,
+		CreatedTime: challenge.CreatedTime,
+	}
 }
 
 // GetPushChallenge returns the challenge for the confirmation page and the sign-in page waiting for it
@@ -73,39 +108,58 @@ func GetPushChallenge(id string) *PushChallenge {
 	if id == "" {
 		return nil
 	}
-	return getPushChallenge(id)
+	challenge := getPushChallenge(id)
+	if challenge == nil {
+		return nil
+	}
+	challenge.mu.Lock()
+	defer challenge.mu.Unlock()
+	return copyPushChallengeLocked(challenge)
 }
 
 // AnswerPushChallenge records the user's answer on the confirmation page
-func AnswerPushChallenge(id string, approve bool) (*PushChallenge, error) {
-	challenge := GetPushChallenge(id)
+func AnswerPushChallenge(approvalToken string, approve bool) (*PushChallenge, error) {
+	challengeId, ok := pushChallengeApprovals.Load(approvalToken)
+	if !ok {
+		return nil, errors.New("the sign-in request doesn't exist or has expired")
+	}
+	challenge := getPushChallenge(challengeId.(string))
 	if challenge == nil {
 		return nil, errors.New("the sign-in request doesn't exist or has expired")
 	}
+	challenge.mu.Lock()
+	defer challenge.mu.Unlock()
 	if challenge.Status != PushChallengePending {
-		return challenge, fmt.Errorf("the sign-in request has been %s", challenge.Status)
+		return copyPushChallengeLocked(challenge), fmt.Errorf("the sign-in request has been %s", challenge.Status)
 	}
 	if approve {
 		challenge.Status = PushChallengeApproved
 	} else {
 		challenge.Status = PushChallengeDenied
 	}
-	return challenge, nil
+	return copyPushChallengeLocked(challenge), nil
 }
 
 // consumePushChallenge is the passcode check of the push MFA: the passcode is the id of a challenge that the
-// user has approved for the same provider and receiver, and it works once
-func consumePushChallenge(id string, provider string, receiver string) error {
-	challenge := GetPushChallenge(id)
-	if challenge == nil || challenge.Provider != provider || challenge.Receiver != receiver {
+// user has approved for the same account, provider and receiver, and it works once
+func consumePushChallenge(id string, userId string, provider string, receiver string) error {
+	challenge := getPushChallenge(id)
+	if challenge == nil {
+		return errors.New("the sign-in request doesn't exist or has expired, please send it again")
+	}
+	challenge.mu.Lock()
+	defer challenge.mu.Unlock()
+	if challenge.UserId != userId || challenge.Provider != provider || challenge.Receiver != receiver {
 		return errors.New("the sign-in request doesn't exist or has expired, please send it again")
 	}
 	switch challenge.Status {
 	case PushChallengeApproved:
-		pushChallenges.Delete(id)
+		challenge.Status = pushChallengeConsumed
+		deletePushChallenge(challenge)
 		return nil
 	case PushChallengeDenied:
-		pushChallenges.Delete(id)
+		challenge.Status = pushChallengeConsumed
+		deletePushChallenge(challenge)
 		return errors.New("the sign-in request was denied on the phone")
 	case PushChallengeExpired:
 		return errors.New("the sign-in request has expired, please send it again")
@@ -133,19 +187,20 @@ func SendPushChallenge(userId string, providerId string, receiver string, applic
 	}
 
 	challenge := &PushChallenge{
-		Id:          util.GenerateId() + util.GenerateId(),
-		UserId:      userId,
-		Provider:    providerId,
-		Receiver:    receiver,
-		Application: application,
-		Ip:          clientIp,
-		Location:    getIpLocation(clientIp),
-		UserAgent:   userAgent,
-		Status:      PushChallengePending,
-		CreatedTime: time.Now(),
+		Id:            util.GenerateId() + util.GenerateId(),
+		ApprovalToken: util.GenerateId() + util.GenerateId(),
+		UserId:        userId,
+		Provider:      providerId,
+		Receiver:      receiver,
+		Application:   application,
+		Ip:            clientIp,
+		Location:      getIpLocation(clientIp),
+		UserAgent:     userAgent,
+		Status:        PushChallengePending,
+		CreatedTime:   time.Now(),
 	}
 
-	confirmUrl := fmt.Sprintf("%s/mfa/push-confirm/%s", origin, challenge.Id)
+	confirmUrl := fmt.Sprintf("%s/mfa/push-confirm/%s", origin, challenge.ApprovalToken)
 	title := "Confirm your sign-in"
 	description := fmt.Sprintf("Account: %s\nApplication: %s\nIP address: %s %s\nTime: %s\nOpen the link and approve it if it is you. It expires in 5 minutes.",
 		userId, application, clientIp, challenge.Location, challenge.CreatedTime.Format("2006-01-02 15:04:05"))
@@ -168,6 +223,7 @@ func SendPushChallenge(userId string, providerId string, receiver string, applic
 	}
 
 	pushChallenges.Store(challenge.Id, challenge)
+	pushChallengeApprovals.Store(challenge.ApprovalToken, challenge.Id)
 	return challenge, nil
 }
 

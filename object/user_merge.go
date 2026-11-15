@@ -58,6 +58,35 @@ func setUserStringField(user *User, field string, value string) {
 	reflect.ValueOf(user).Elem().FieldByName(field).SetString(value)
 }
 
+// clearMergedUserLoginIdentifiers removes every login selector transferred away from a
+// soft-deleted merge source. Lookup helpers do not consistently exclude deleted rows, so
+// retaining these values can make a later sign-in resolve to the deleted account instead
+// of the account that kept the identifiers.
+func clearMergedUserLoginIdentifiers(user *User) []string {
+	columns := []string{"email", "email_verified", "phone", "country_code"}
+	user.Email = ""
+	user.EmailVerified = false
+	user.Phone = ""
+	user.CountryCode = ""
+
+	for _, field := range userProviderFields {
+		setUserStringField(user, field, "")
+		columns = append(columns, ormerColumnName(field))
+	}
+
+	propertiesChanged := false
+	for key := range user.Properties {
+		if strings.HasPrefix(strings.ToLower(key), "oauth_") {
+			delete(user.Properties, key)
+			propertiesChanged = true
+		}
+	}
+	if propertiesChanged {
+		columns = append(columns, "properties")
+	}
+	return columns
+}
+
 // GetUserMergeError tells why the account "from" can't be merged into the account "into",
 // an empty string means that "into" can take over everything "from" signs in with
 func GetUserMergeError(from *User, into *User, lang string) string {
@@ -197,6 +226,12 @@ func MergeUser(from *User, into *User) error {
 	_, err = DeleteUser(from)
 	if err != nil {
 		return err
+	}
+	if from.IsDeleted {
+		_, err = UpdateUser(from.GetId(), from, clearMergedUserLoginIdentifiers(from), true)
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err = UpdateUser(into.GetId(), into, columns, true)
