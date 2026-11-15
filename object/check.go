@@ -706,7 +706,7 @@ func CheckApplicationSignin(application *Application, user *User, clientIp strin
 		return err
 	}
 
-	allowed, err := CheckLoginPermission(user.GetId(), application)
+	allowed, err := CheckLoginPermissionForUser(user, application)
 	if err != nil {
 		return err
 	}
@@ -748,6 +748,45 @@ func checkUserOrganizationSignin(application *Application, user *User, clientIp 
 }
 
 func CheckLoginPermission(userId string, application *Application) (bool, error) {
+	user, err := GetUser(userId)
+	if err != nil {
+		return false, err
+	}
+	return checkLoginPermission(userId, user, application)
+}
+
+// CheckLoginPermissionForUser evaluates the supplied user's current attributes.
+// Signup uses it before persistence so group policies cannot be bypassed merely
+// because the pending user is not queryable from the database yet.
+func CheckLoginPermissionForUser(user *User, application *Application) (bool, error) {
+	if user == nil {
+		return false, errors.New("the user does not exist")
+	}
+	return checkLoginPermission(user.GetId(), user, application)
+}
+
+type loginPermissionEnforcer interface {
+	Enforce(rvals ...interface{}) (bool, error)
+}
+
+func enforceLoginPermissionGroups(enforcer loginPermissionEnforcer, groupSubjects []string, applicationName, effect string) (int, int, error) {
+	allowCount := 0
+	denyCount := 0
+	for _, groupSubject := range groupSubjects {
+		isAllowed, err := enforcer.Enforce(groupSubject, applicationName, "Read")
+		if err != nil {
+			return 0, 0, err
+		}
+		if isAllowed && effect == "Allow" {
+			allowCount++
+		} else if !isAllowed && effect == "Deny" {
+			denyCount++
+		}
+	}
+	return allowCount, denyCount, nil
+}
+
+func checkLoginPermission(userId string, user *User, application *Application) (bool, error) {
 	owner, _, err := util.GetOwnerAndNameFromIdWithError(userId)
 	if err != nil {
 		return false, err
@@ -756,10 +795,6 @@ func CheckLoginPermission(userId string, application *Application) (bool, error)
 		return true, nil
 	}
 
-	user, err := GetUser(userId)
-	if err != nil {
-		return false, err
-	}
 	if user != nil && user.IsAdmin {
 		return true, nil
 	}
@@ -784,7 +819,8 @@ func CheckLoginPermission(userId string, application *Application) (bool, error)
 		}
 
 		userHit := permission.isUserHit(userId)
-		groupHit := permission.isGroupHit(userId)
+		groupSubjects := permission.getGroupSubjectsForUser(user)
+		groupHit := len(groupSubjects) > 0
 		roleHit := permission.isRoleHit(userId)
 		if (groupHit || roleHit) && !isRbacAllowed() {
 			return false, requireRbac()
@@ -823,20 +859,12 @@ func CheckLoginPermission(userId string, application *Application) (bool, error)
 			}
 		}
 		if groupHit {
-			isAllowed, err = enforcer.Enforce(userId, application.Name, "Read")
+			groupAllows, groupDenies, err := enforceLoginPermissionGroups(enforcer, groupSubjects, application.Name, permission.Effect)
 			if err != nil {
 				return false, err
 			}
-
-			if isAllowed {
-				if permission.Effect == "Allow" {
-					allowCount += 1
-				}
-			} else {
-				if permission.Effect == "Deny" {
-					denyCount += 1
-				}
-			}
+			allowCount += groupAllows
+			denyCount += groupDenies
 		}
 		if roleHit {
 			targetRoles, err := getRolesByUser(userId)

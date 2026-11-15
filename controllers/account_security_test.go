@@ -9,55 +9,76 @@ import (
 )
 
 func TestCerberusSecuritySignupOAuthCodeIsBoundToSignupApplication(t *testing.T) {
-	signupApplication := &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"}
-
 	tests := []struct {
-		name     string
-		target   *object.Application
-		clientId string
-		want     bool
+		name               string
+		signup             *object.Application
+		target             *object.Application
+		clientId           string
+		signupOrganization string
+		want               bool
 	}{
 		{
-			name:     "same application and client",
-			target:   &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
-			clientId: "signup-client",
-			want:     true,
+			name:               "same application and client",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			target:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			clientId:           "signup-client",
+			signupOrganization: "tenant-a",
+			want:               true,
 		},
 		{
-			name:     "same shared application with qualified client",
-			target:   &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a", IsShared: true},
-			clientId: "signup-client-org-tenant-a",
-			want:     true,
+			name:               "shared application with qualified client in another organization",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-home", IsShared: true},
+			target:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a", IsShared: true},
+			clientId:           "signup-client-org-tenant-a",
+			signupOrganization: "tenant-a",
+			want:               true,
 		},
 		{
-			name:     "different application in same organization",
-			target:   &object.Application{Owner: "org-a", Name: "restricted-app", ClientId: "restricted-client", Organization: "tenant-a"},
-			clientId: "restricted-client",
+			name:               "different application in same organization",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			target:             &object.Application{Owner: "org-a", Name: "restricted-app", ClientId: "restricted-client", Organization: "tenant-a"},
+			clientId:           "restricted-client",
+			signupOrganization: "tenant-a",
 		},
 		{
-			name:     "same application identity with mismatched client selector",
-			target:   &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
-			clientId: "restricted-client",
+			name:               "same application identity with mismatched client selector",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			target:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			clientId:           "restricted-client",
+			signupOrganization: "tenant-a",
 		},
 		{
-			name:     "different application owner",
-			target:   &object.Application{Owner: "org-b", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
-			clientId: "signup-client",
+			name:               "different application owner",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			target:             &object.Application{Owner: "org-b", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			clientId:           "signup-client",
+			signupOrganization: "tenant-a",
 		},
 		{
-			name:     "same shared application for a different effective organization",
-			target:   &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-b", IsShared: true},
-			clientId: "signup-client-org-tenant-b",
+			name:               "qualified client does not match posted organization",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-home", IsShared: true},
+			target:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-b", IsShared: true},
+			clientId:           "signup-client-org-tenant-b",
+			signupOrganization: "tenant-a",
 		},
 		{
-			name:     "missing target application",
-			clientId: "signup-client",
+			name:               "qualified client cannot re-scope a non-shared application",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-home"},
+			target:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-home"},
+			clientId:           "signup-client-org-tenant-a",
+			signupOrganization: "tenant-a",
+		},
+		{
+			name:               "missing target application",
+			signup:             &object.Application{Owner: "org-a", Name: "signup-app", ClientId: "signup-client", Organization: "tenant-a"},
+			clientId:           "signup-client",
+			signupOrganization: "tenant-a",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isSignupOAuthApplication(signupApplication, tt.target, tt.clientId); got != tt.want {
+			if got := isSignupOAuthApplication(tt.signup, tt.target, tt.clientId, tt.signupOrganization); got != tt.want {
 				t.Fatalf("isSignupOAuthApplication() = %v, want %v", got, tt.want)
 			}
 		})

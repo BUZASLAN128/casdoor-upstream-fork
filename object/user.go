@@ -1416,25 +1416,39 @@ func TerminateUserAccess(user *User) error {
 	return nil
 }
 
-func DeleteUser(user *User) (bool, error) {
+func prepareUserDeletion(user *User) error {
 	// Forced offline the user first, its tokens would otherwise outlive the user row
 	err := TerminateUserAccess(user)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	_, err = userEnforcer.DeleteGroupsForUser(user.GetId())
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	_, err = DeleteThirdPartyLinksByUser(user.Owner, user.Name)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	err = DeletePasswordHistoryByUser(user.Owner, user.Name)
 	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteUserPermanentlyForMerge(user *User) (bool, error) {
+	if err := prepareUserDeletion(user); err != nil {
+		return false, err
+	}
+	return deleteUser(user)
+}
+
+func DeleteUser(user *User) (bool, error) {
+	if err := prepareUserDeletion(user); err != nil {
 		return false, err
 	}
 

@@ -78,12 +78,20 @@ type LaravelResponse struct {
 	UpdatedAt       string `json:"updated_at"`
 }
 
-func isSignupOAuthApplication(signupApplication *object.Application, targetApplication *object.Application, clientId string) bool {
-	if signupApplication == nil || targetApplication == nil || targetApplication.GetId() != signupApplication.GetId() || targetApplication.Organization != signupApplication.Organization {
+func isSignupOAuthApplication(signupApplication *object.Application, targetApplication *object.Application, clientId, signupOrganization string) bool {
+	if signupApplication == nil || targetApplication == nil || targetApplication.GetId() != signupApplication.GetId() {
 		return false
 	}
-	realClientId, _ := util.GetSharedOrgFromApp(clientId)
-	return targetApplication.ClientId == realClientId
+	realClientId, sharedOrganization := util.GetSharedOrgFromApp(clientId)
+	if targetApplication.ClientId != realClientId {
+		return false
+	}
+
+	effectiveOrganization := signupApplication.Organization
+	if signupApplication.IsShared && sharedOrganization != "" {
+		effectiveOrganization = sharedOrganization
+	}
+	return targetApplication.Organization == effectiveOrganization && signupOrganization == effectiveOrganization
 }
 
 // Signup
@@ -132,7 +140,7 @@ func (c *ApiController) Signup() {
 			c.ResponseError(err.Error())
 			return
 		}
-		if !isSignupOAuthApplication(application, codeApplication, clientId) {
+		if !isSignupOAuthApplication(application, codeApplication, clientId, authForm.Organization) {
 			c.ResponseError(c.T("auth:Unauthorized operation"))
 			return
 		}

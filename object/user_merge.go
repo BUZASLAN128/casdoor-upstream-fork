@@ -223,7 +223,11 @@ func MergeUser(from *User, into *User) error {
 		}
 	}
 
-	_, err = DeleteUser(from)
+	// Merge linearizes the deletion policy at the guard above. Always remove the
+	// source permanently after identifiers have moved; re-reading a concurrently
+	// changed soft-delete setting here could retain both accounts with the same
+	// login selectors.
+	_, err = deleteUserPermanentlyForMerge(from)
 	if err != nil {
 		return err
 	}

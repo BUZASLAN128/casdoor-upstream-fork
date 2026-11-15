@@ -612,17 +612,30 @@ func (p *Permission) isGroupHit(userId string) bool {
 	if err != nil || user == nil {
 		return false
 	}
+	return len(p.getGroupSubjectsForUser(user)) > 0
+}
 
+// Keep the exact policy subjects rather than just a boolean. A user being
+// created by signup is not in the database yet, so the permission enforcer's
+// runtime grouping policies cannot contain it. Evaluating the matching group
+// subjects directly preserves the same policy before the account is written.
+func (p *Permission) getGroupSubjectsForUser(user *User) []string {
+	if user == nil {
+		return nil
+	}
+
+	res := []string{}
 	for _, group := range p.Groups {
-		if group == "*" || group == util.GetId(p.Owner, "*") {
-			return len(user.Groups) > 0
+		if (group == "*" || group == util.GetId(p.Owner, "*")) && len(user.Groups) > 0 {
+			res = append(res, getPermissionGroupSubject(p.Owner, group))
+			continue
 		}
 
 		if util.InSlice(user.Groups, group) {
-			return true
+			res = append(res, getPermissionGroupSubject(p.Owner, group))
 		}
 	}
-	return false
+	return res
 }
 
 func (p *Permission) isRoleHit(userId string) bool {
