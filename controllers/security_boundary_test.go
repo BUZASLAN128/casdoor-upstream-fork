@@ -65,3 +65,45 @@ func TestCerberusSecurityGrantConsentGuardsBeforeMutation(t *testing.T) {
 		t.Fatal("GrantConsent must finish sign-in and application membership checks before consent mutation and code issuance")
 	}
 }
+
+func TestCerberusSecurityMergeCannotSwitchIntoMfaProtectedAccount(t *testing.T) {
+	current := &object.User{Owner: "organization-a", Name: "current"}
+	protectedOther := &object.User{Owner: "organization-a", Name: "protected", PreferredMfaType: "totp"}
+	unprotectedOther := &object.User{Owner: "organization-a", Name: "unprotected"}
+
+	if canMergeAccounts(current, current, protectedOther) {
+		t.Fatal("merge switched into another MFA-protected account without its second factor")
+	}
+	if canMergeAccounts(current, protectedOther, current) {
+		t.Fatal("merge absorbed another MFA-protected account without its second factor")
+	}
+	if !canMergeAccounts(current, current, unprotectedOther) || !canMergeAccounts(current, unprotectedOther, current) {
+		t.Fatal("merge unexpectedly rejected an unprotected target account")
+	}
+	current.PreferredMfaType = "totp"
+	if !canMergeAccounts(current, current, unprotectedOther) {
+		t.Fatal("merge rejected the MFA-authenticated current account as its own target")
+	}
+	if canMergeAccounts(nil, current, unprotectedOther) || canMergeAccounts(current, nil, unprotectedOther) || canMergeAccounts(current, current, nil) {
+		t.Fatal("merge target guard did not fail closed for a missing identity")
+	}
+}
+
+func TestCerberusSecurityMergePrecheckDoesNotExposeMfaEnrollment(t *testing.T) {
+	source, err := os.ReadFile("user_merge.go")
+	if err != nil {
+		t.Fatalf("read user_merge.go: %v", err)
+	}
+	text := string(source)
+	checkStart := strings.Index(text, "func (c *ApiController) CheckUserMerge()")
+	mergeStart := strings.Index(text, "func (c *ApiController) MergeUser()")
+	if checkStart < 0 || mergeStart < 0 || checkStart >= mergeStart {
+		t.Fatal("merge endpoints not found in expected order")
+	}
+	if strings.Contains(text[checkStart:mergeStart], "canMergeAccounts(") {
+		t.Fatal("unverified merge precheck exposes MFA-dependent eligibility")
+	}
+	if !strings.Contains(text[mergeStart:], "canMergeAccounts(") {
+		t.Fatal("verified merge mutation does not enforce the MFA boundary")
+	}
+}

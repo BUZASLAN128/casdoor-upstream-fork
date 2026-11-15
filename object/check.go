@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/cred"
 	"github.com/casdoor/casdoor/form"
 	"github.com/casdoor/casdoor/i18n"
@@ -680,6 +681,16 @@ func CheckPasswordOnlySignin(user *User, clientIp string, lang string) error {
 }
 
 func CheckApplicationSignin(application *Application, user *User, clientIp string, lang string) error {
+	return checkApplicationSignin(application, user, clientIp, lang, false)
+}
+
+// CheckApplicationSigninForSignup evaluates a pending user under the identity
+// that AddUser will persist, without rewriting identities during normal sign-in.
+func CheckApplicationSigninForSignup(application *Application, user *User, clientIp string, lang string) error {
+	return checkApplicationSignin(application, user, clientIp, lang, true)
+}
+
+func checkApplicationSignin(application *Application, user *User, clientIp string, lang string, pendingSignup bool) error {
 	if user.IsForbidden {
 		return errors.New(i18n.Translate(lang, "check:The user is forbidden to sign in, please contact the administrator"))
 	}
@@ -706,7 +717,12 @@ func CheckApplicationSignin(application *Application, user *User, clientIp strin
 		return err
 	}
 
-	allowed, err := CheckLoginPermissionForUser(user, application)
+	var allowed bool
+	if pendingSignup {
+		allowed, err = CheckLoginPermissionForSignupUser(user, application)
+	} else {
+		allowed, err = CheckLoginPermissionForUser(user, application)
+	}
 	if err != nil {
 		return err
 	}
@@ -765,6 +781,23 @@ func CheckLoginPermissionForUser(user *User, application *Application) (bool, er
 	return checkLoginPermission(user.GetId(), user, application)
 }
 
+func CheckLoginPermissionForSignupUser(user *User, application *Application) (bool, error) {
+	if user == nil {
+		return false, errors.New("the user does not exist")
+	}
+	authorizationUser := normalizeLoginPermissionUser(user, conf.GetConfigBool("isUsernameLowered"))
+	return checkLoginPermission(authorizationUser.GetId(), authorizationUser, application)
+}
+
+func normalizeLoginPermissionUser(user *User, lowerUsername bool) *User {
+	if user == nil || !lowerUsername {
+		return user
+	}
+	authorizationUser := *user
+	authorizationUser.Name = strings.ToLower(authorizationUser.Name)
+	return &authorizationUser
+}
+
 type loginPermissionEnforcer interface {
 	Enforce(rvals ...interface{}) (bool, error)
 }
@@ -791,7 +824,7 @@ func getMatchingLoginPermissionRoles(permission *Permission, targetRoles []*Role
 	seen := map[string]bool{}
 	for _, permissionRole := range permission.Roles {
 		if permissionRole == "*" {
-			return true, targetRoles
+			return len(targetRoles) > 0, targetRoles
 		}
 
 		for _, targetRole := range targetRoles {

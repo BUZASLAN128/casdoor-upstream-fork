@@ -97,6 +97,25 @@ func getMergePair(user *object.User, other *object.User, keep string) (*object.U
 	return other, user
 }
 
+// canMergeAccounts permits a merge only when every MFA-protected participant is
+// the account that authenticated the current session. Possession of another
+// account's email or phone code is not a substitute for its configured MFA.
+func canMergeAccounts(signedInUser *object.User, from *object.User, into *object.User) bool {
+	if signedInUser == nil || from == nil || into == nil {
+		return false
+	}
+	if signedInUser.Owner == "" || signedInUser.Name == "" || from.Owner == "" || from.Name == "" || into.Owner == "" || into.Name == "" {
+		return false
+	}
+	signedInId := signedInUser.GetId()
+	fromId := from.GetId()
+	intoId := into.GetId()
+	if signedInId != fromId && signedInId != intoId {
+		return false
+	}
+	return (signedInId == fromId || !from.IsMfaEnabled()) && (signedInId == intoId || !into.IsMfaEnabled())
+}
+
 // CheckUserMerge
 // @Tag User API
 // @Title CheckUserMerge
@@ -133,7 +152,6 @@ func (c *ApiController) CheckUserMerge() {
 		}
 		return
 	}
-
 	c.ResponseOk("merge")
 }
 
@@ -199,6 +217,10 @@ func (c *ApiController) MergeUser() {
 	from, into := getMergePair(user, other, keep)
 	if msg := object.GetUserMergeError(from, into, c.GetAcceptLanguage()); msg != "" {
 		c.ResponseError(msg)
+		return
+	}
+	if !canMergeAccounts(user, from, into) {
+		c.ResponseError(c.T("auth:Unauthorized operation"))
 		return
 	}
 

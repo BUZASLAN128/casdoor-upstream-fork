@@ -24,6 +24,7 @@ import (
 	"github.com/casdoor/casdoor/i18n"
 	"github.com/casdoor/casdoor/util"
 	"github.com/xorm-io/core"
+	"github.com/xorm-io/xorm"
 )
 
 const (
@@ -261,18 +262,23 @@ func CreatePrivilegedRequest(user *User, accountName string, reason string, minu
 		ExpireTime:         formatPamTime(now.Add(pamPendingWindow)),
 	}
 
+	inserted := false
 	if !account.RequireApproval {
-		if err = activatePrivilegedRequest(request, account, lang); err != nil {
-			return nil, err
+		if account.isRole() {
+			if err = insertActivePamRoleRequest(request, account, lang); err != nil {
+				return nil, err
+			}
+			inserted = true
+		} else {
+			activatePrivilegedRequest(request)
 		}
 	}
 
-	_, err = ormer.Engine.Insert(request)
-	if err != nil {
-		if request.RoleAdded {
-			removeUserFromPamRole(request)
+	if !inserted {
+		_, err = ormer.Engine.Insert(request)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
 	}
 
 	if request.State == PamStatePending {
@@ -283,70 +289,243 @@ func CreatePrivilegedRequest(user *User, accountName string, reason string, minu
 	return request, nil
 }
 
-// activatePrivilegedRequest starts the access window, putting the user into the role of a role request
-func activatePrivilegedRequest(request *PrivilegedRequest, account *PrivilegedAccount, lang string) error {
-	if account.isRole() {
-		if err := addUserToPamRole(request, lang); err != nil {
-			return err
-		}
-	}
+// activatePrivilegedRequest starts the access window for a password request.
+// Role requests use the transactional helpers below so request state and role
+// membership cannot be committed separately.
+func activatePrivilegedRequest(request *PrivilegedRequest) {
 	now := time.Now()
 	request.State = PamStateActive
 	request.StartTime = formatPamTime(now)
 	request.ExpireTime = formatPamTime(now.Add(time.Duration(request.DurationMinutes) * time.Minute))
-	return nil
 }
 
-func addUserToPamRole(request *PrivilegedRequest, lang string) error {
-	role, err := getRole(request.Owner, request.Role)
+func getPamRoleUsersAfterMutation(users []string, userId string, add bool) ([]string, bool) {
+	if add {
+		if util.InSlice(users, userId) {
+			return users, false
+		}
+		return append(users, userId), true
+	}
+
+	updated := make([]string, 0, len(users))
+	changed := false
+	for _, user := range users {
+		if user == userId {
+			changed = true
+			continue
+		}
+		updated = append(updated, user)
+	}
+	return updated, changed
+}
+
+// updatePamRoleMembershipInSession locks and mutates a role inside the caller's
+// transaction. Callers commit request state and role membership together, so a
+// failed activation or cleanup cannot leave an untracked privileged membership.
+func updatePamRoleMembershipInSession(session *xorm.Session, request *PrivilegedRequest, add bool, lang string) (bool, error) {
+	roleId := util.GetId(request.Owner, request.Role)
+	role := &Role{Owner: request.Owner, Name: request.Role}
+	existed, err := session.ForUpdate().Get(role)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if role == nil {
-		return fmt.Errorf(i18n.Translate(lang, "pam:The role: %s does not exist in the organization"), request.Role)
+	if !existed {
+		return false, fmt.Errorf(i18n.Translate(lang, "pam:The role: %s does not exist in the organization"), request.Role)
 	}
+
 	userId := util.GetId(request.Owner, request.Requester)
-	if util.InSlice(role.Users, userId) {
-		request.RoleAdded = false
-		return nil
+	updatedUsers, changed := getPamRoleUsersAfterMutation(role.Users, userId, add)
+	if !changed {
+		return false, nil
+	}
+	role.Users = updatedUsers
+	if add {
+		if err = CheckRoleSod(role, lang); err != nil {
+			return false, err
+		}
 	}
 
-	role.Users = append(role.Users, userId)
-	if err = CheckRoleSod(role, lang); err != nil {
-		return err
+	affected, err := session.ID(core.PK{role.Owner, role.Name}).Cols("users").Update(role)
+	if err != nil {
+		return false, err
 	}
-	_, err = ormer.Engine.ID(core.PK{role.Owner, role.Name}).Cols("users").Update(role)
+	if affected != 1 {
+		return false, fmt.Errorf("the privileged role changed while updating membership: %s", roleId)
+	}
+	return true, nil
+}
+
+func addPamRoleRecord(request *PrivilegedRequest) {
+	addPamRecord(request.Owner, request.Requester, "add-privileged-role", map[string]string{"request": request.GetId(), "role": util.GetId(request.Owner, request.Role), "user": util.GetId(request.Owner, request.Requester), "expireTime": request.ExpireTime}, "")
+}
+
+func removePamRoleRecord(request *PrivilegedRequest) {
+	addPamRecord(request.Owner, request.Requester, "remove-privileged-role", map[string]string{"request": request.GetId(), "role": util.GetId(request.Owner, request.Role), "user": util.GetId(request.Owner, request.Requester)}, "")
+}
+
+func lockEnabledPamRoleAccount(session *xorm.Session, request *PrivilegedRequest, expected *PrivilegedAccount, lang string) error {
+	account := &PrivilegedAccount{Owner: request.Owner, Name: request.Account}
+	existed, err := session.ForUpdate().Get(account)
 	if err != nil {
 		return err
 	}
-	request.RoleAdded = true
-	addPamRecord(request.Owner, request.Requester, "add-privileged-role", map[string]string{"request": request.GetId(), "role": role.GetId(), "user": userId, "expireTime": formatPamTime(time.Now().Add(time.Duration(request.DurationMinutes) * time.Minute))}, "")
+	if !existed || !account.IsEnabled || !account.isRole() || account.Role != request.Role ||
+		expected == nil || account.GetId() != expected.GetId() {
+		return fmt.Errorf(i18n.Translate(lang, "pam:You cannot request the privileged account: %s"), request.Account)
+	}
 	return nil
 }
 
-func removeUserFromPamRole(request *PrivilegedRequest) {
-	role, err := getRole(request.Owner, request.Role)
-	failure := ""
+func insertActivePamRoleRequest(request *PrivilegedRequest, account *PrivilegedAccount, lang string) error {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return err
+	}
+
+	if err := lockEnabledPamRoleAccount(session, request, account, lang); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	changed, err := updatePamRoleMembershipInSession(session, request, true, lang)
 	if err != nil {
-		failure = err.Error()
-	} else if role != nil {
-		userId := util.GetId(request.Owner, request.Requester)
-		users := []string{}
-		for _, user := range role.Users {
-			if user != userId {
-				users = append(users, user)
-			}
-		}
-		role.Users = users
-		_, err = ormer.Engine.ID(core.PK{role.Owner, role.Name}).Cols("users").Update(role)
-		if err != nil {
-			failure = err.Error()
+		_ = session.Rollback()
+		return err
+	}
+	activatePrivilegedRequest(request)
+	request.RoleAdded = changed
+	if _, err = session.Insert(request); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	if err = session.Commit(); err != nil {
+		_ = session.Rollback()
+		return err
+	}
+	if changed {
+		addPamRoleRecord(request)
+	}
+	return nil
+}
+
+func activatePendingPamRoleRequest(request *PrivilegedRequest, account *PrivilegedAccount, lang string) (bool, error) {
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+
+	stored := &PrivilegedRequest{Owner: request.Owner, Name: request.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	if !existed || stored.State != PamStatePending {
+		_ = session.Rollback()
+		return false, nil
+	}
+	if stored.Account != account.Name || stored.Role != account.Role || !account.isRole() {
+		_ = session.Rollback()
+		return false, errors.New(i18n.Translate(lang, "pam:The request has just been changed, please refresh"))
+	}
+	if err = lockEnabledPamRoleAccount(session, stored, account, lang); err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+
+	changed, err := updatePamRoleMembershipInSession(session, stored, true, lang)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	stored.Approver = request.Approver
+	stored.Comment = request.Comment
+	stored.DecisionTime = request.DecisionTime
+	activatePrivilegedRequest(stored)
+	stored.RoleAdded = changed
+	stored.UpdatedTime = util.GetCurrentTime()
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Where("state = ?", PamStatePending).
+		Cols("approver", "comment", "decision_time", "start_time", "expire_time", "role_added", "state", "updated_time").Update(stored)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	if affected != 1 {
+		_ = session.Rollback()
+		return false, nil
+	}
+	if err = session.Commit(); err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	*request = *stored
+	if changed {
+		addPamRoleRecord(request)
+	}
+	return true, nil
+}
+
+func endActivePamRoleRequest(request *PrivilegedRequest, state string) (bool, error) {
+	fromState := request.State
+	session := ormer.Engine.NewSession()
+	defer session.Close()
+	if err := session.Begin(); err != nil {
+		return false, err
+	}
+
+	stored := &PrivilegedRequest{Owner: request.Owner, Name: request.Name}
+	existed, err := session.ForUpdate().Get(stored)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	if !existed || stored.State != fromState {
+		_ = session.Rollback()
+		return false, nil
+	}
+	hadRoleAdded := stored.RoleAdded
+	if hadRoleAdded {
+		if _, err = updatePamRoleMembershipInSession(session, stored, false, ""); err != nil {
+			_ = session.Rollback()
+			return false, err
 		}
 	}
-	if failure != "" {
-		logs.Error("failed to take the user: %s out of the role: %s of the privileged request: %s: %s", request.Requester, request.Role, request.GetId(), failure)
+
+	stored.State = state
+	stored.EndTime = formatPamTime(time.Now())
+	stored.RoleAdded = false
+	stored.UpdatedTime = util.GetCurrentTime()
+	affected, err := session.ID(core.PK{stored.Owner, stored.Name}).Where("state = ?", fromState).
+		Cols("end_time", "role_added", "state", "updated_time").Update(stored)
+	if err != nil {
+		_ = session.Rollback()
+		return false, err
 	}
-	addPamRecord(request.Owner, request.Requester, "remove-privileged-role", map[string]string{"request": request.GetId(), "role": util.GetId(request.Owner, request.Role), "user": util.GetId(request.Owner, request.Requester)}, failure)
+	if affected != 1 {
+		_ = session.Rollback()
+		return false, nil
+	}
+	if err = session.Commit(); err != nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	*request = *stored
+	if hadRoleAdded {
+		removePamRoleRecord(request)
+	}
+	return true, nil
+}
+
+func checkPrivilegedAccountEnabledForDecision(account *PrivilegedAccount, approve bool, lang string) error {
+	if approve && (account == nil || !account.IsEnabled) {
+		name := ""
+		if account != nil {
+			name = account.Name
+		}
+		return fmt.Errorf(i18n.Translate(lang, "pam:You cannot request the privileged account: %s"), name)
+	}
+	return nil
 }
 
 // DecidePrivilegedRequest approves or rejects a pending request, by one of its approvers other than the requester
@@ -368,6 +547,9 @@ func DecidePrivilegedRequest(approver *User, id string, approve bool, comment st
 	if !account.isApprover(approver) {
 		return nil, errors.New(i18n.Translate(lang, "pam:You are not an approver of this account"))
 	}
+	if err = checkPrivilegedAccountEnabledForDecision(account, approve, lang); err != nil {
+		return nil, err
+	}
 	if request.State != PamStatePending {
 		return nil, fmt.Errorf(i18n.Translate(lang, "pam:The request is %s, not pending"), request.State)
 	}
@@ -376,16 +558,25 @@ func DecidePrivilegedRequest(approver *User, id string, approve bool, comment st
 	request.Approver = approver.Name
 	request.Comment = comment
 	request.DecisionTime = formatPamTime(now)
+	if approve && account.isRole() {
+		ok, err := activatePendingPamRoleRequest(request, account, lang)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errors.New(i18n.Translate(lang, "pam:The request has just been changed, please refresh"))
+		}
+		util.SafeGoroutine(func() {
+			notifyPamRequester(request, origin, lang)
+		})
+		return request, nil
+	}
+
 	columns := []string{"approver", "comment", "decision_time", "expire_time"}
 	if !approve {
 		request.State = PamStateRejected
 		request.EndTime = formatPamTime(now)
 		columns = append(columns, "end_time")
-	} else if account.isRole() {
-		if err = activatePrivilegedRequest(request, account, lang); err != nil {
-			return nil, err
-		}
-		columns = append(columns, "start_time", "role_added")
 	} else {
 		request.State = PamStateApproved
 		request.ExpireTime = formatPamTime(now.Add(pamCheckoutWindow))
@@ -393,9 +584,6 @@ func DecidePrivilegedRequest(approver *User, id string, approve bool, comment st
 
 	ok, err := updateRequestState(request, PamStatePending, columns...)
 	if err != nil || !ok {
-		if request.RoleAdded {
-			removeUserFromPamRole(request)
-		}
 		if err == nil {
 			err = errors.New(i18n.Translate(lang, "pam:The request has just been changed, please refresh"))
 		}
@@ -444,9 +632,7 @@ func RevealPrivilegedPassword(user *User, id string, lang string) (string, *Priv
 		if now.After(expireTime) {
 			return "", nil, errors.New(i18n.Translate(lang, "pam:The access has expired"))
 		}
-		if err = activatePrivilegedRequest(request, account, lang); err != nil {
-			return "", nil, err
-		}
+		activatePrivilegedRequest(request)
 		ok, err := updateRequestState(request, PamStateApproved, "start_time", "expire_time")
 		if err != nil {
 			return "", nil, err
@@ -522,6 +708,10 @@ func CancelPrivilegedRequest(user *User, id string, lang string) (*PrivilegedReq
 // endPrivilegedRequest returns or expires an approved or active request: the user leaves the role, and the account's
 // password is due for rotation if it was revealed and the account rotates after check-in
 func endPrivilegedRequest(request *PrivilegedRequest, state string) (bool, error) {
+	if request.Type == PamTypeRole {
+		return endActivePamRoleRequest(request, state)
+	}
+
 	fromState := request.State
 	request.State = state
 	request.EndTime = formatPamTime(time.Now())
@@ -530,9 +720,6 @@ func endPrivilegedRequest(request *PrivilegedRequest, state string) (bool, error
 		return ok, err
 	}
 
-	if request.RoleAdded {
-		removeUserFromPamRole(request)
-	}
 	if request.RevealCount > 0 {
 		account, err := getPrivilegedAccount(request.Owner, request.Account)
 		if err != nil {

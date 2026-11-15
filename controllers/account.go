@@ -322,7 +322,7 @@ func (c *ApiController) Signup() {
 	if application.DefaultTag != "" && user.Tag == "" {
 		user.Tag = application.DefaultTag
 	}
-	if codeApplication != nil && (!c.checkApplicationSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication)) {
+	if codeApplication != nil && (!c.checkApplicationSignupSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication)) {
 		return
 	}
 

@@ -2,7 +2,9 @@ package object
 
 import (
 	"fmt"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +125,63 @@ func TestCerberusSecurityPendingSignupRolePermissionKeepsAllowAndDenyEffects(t *
 	)
 	if err != nil || allow != 0 || deny != 1 {
 		t.Fatalf("role deny evaluation = (%d, %d, %v), want (0, 1, nil)", allow, deny, err)
+	}
+}
+
+func TestCerberusSecurityPendingSignupRoleWildcardRequiresAMembership(t *testing.T) {
+	permission := &Permission{Owner: "tenant-a", Roles: []string{"*"}}
+	if hit, roles := getMatchingLoginPermissionRoles(permission, nil); hit || len(roles) != 0 {
+		t.Fatalf("role wildcard matched a role-less pending user: hit=%v roles=%#v", hit, roles)
+	}
+
+	memberRole := &Role{Owner: "tenant-a", Name: "member"}
+	if hit, roles := getMatchingLoginPermissionRoles(permission, []*Role{memberRole}); !hit || len(roles) != 1 {
+		t.Fatalf("role wildcard did not match a pending role member: hit=%v roles=%#v", hit, roles)
+	}
+}
+
+func TestCerberusSecurityPendingSignupRoleLookupUsesPersistedUsernameCase(t *testing.T) {
+	pending := &User{Owner: "tenant-a", Name: "Alice"}
+	authorizationUser := normalizeLoginPermissionUser(pending, true)
+	if authorizationUser.Name != "alice" || authorizationUser.GetId() != "tenant-a/alice" {
+		t.Fatalf("authorization identity = %q/%q, want persisted lower-case identity", authorizationUser.Name, authorizationUser.GetId())
+	}
+	if pending.Name != "Alice" {
+		t.Fatalf("authorization normalization mutated the pending signup object: %q", pending.Name)
+	}
+
+	directRole := &Role{Owner: "tenant-a", Name: "direct", Users: []string{"tenant-a/alice"}}
+	want := []string{""}
+	if got := getRoleSourcesForSuppliedUser(directRole, authorizationUser.GetId(), authorizationUser); !reflect.DeepEqual(got, want) {
+		t.Fatalf("lower-case direct role sources = %#v, want %#v", got, want)
+	}
+	ancestorRole := &Role{Owner: "tenant-a", Name: "ancestor", Roles: []string{directRole.GetId()}}
+	roles := []*Role{directRole, ancestorRole}
+	sources := map[string][]string{directRole.GetId(): {""}}
+	fillSourceGroups(roles, sources)
+	if ancestorRole.SourceGroups != nil {
+		t.Fatalf("lower-case direct assignment did not propagate to inherited role: %#v", ancestorRole.SourceGroups)
+	}
+}
+
+func TestCerberusSecurityUsernameNormalizationIsSignupOnly(t *testing.T) {
+	source, err := os.ReadFile("check.go")
+	if err != nil {
+		t.Fatalf("read check.go: %v", err)
+	}
+	text := string(source)
+	normalStart := strings.Index(text, "func CheckLoginPermissionForUser(")
+	signupStart := strings.Index(text, "func CheckLoginPermissionForSignupUser(")
+	normalizeStart := strings.Index(text, "func normalizeLoginPermissionUser(")
+	if normalStart < 0 || signupStart < 0 || normalizeStart < 0 || !(normalStart < signupStart && signupStart < normalizeStart) {
+		t.Fatal("login permission entry points not found in expected order")
+	}
+	normalBody := text[normalStart:signupStart]
+	signupBody := text[signupStart:normalizeStart]
+	if strings.Contains(normalBody, "normalizeLoginPermissionUser(") {
+		t.Fatal("ordinary sign-in rewrites the persisted username before authorization")
+	}
+	if !strings.Contains(signupBody, "normalizeLoginPermissionUser(") {
+		t.Fatal("pending signup does not authorize the username that AddUser will persist")
 	}
 }

@@ -91,7 +91,7 @@ func TestCerberusSecuritySignupOAuthGuardsRunBeforeAccountMutation(t *testing.T)
 		t.Fatalf("read account.go: %v", err)
 	}
 	text := string(source)
-	guard := strings.Index(text, "if codeApplication != nil && (!c.checkApplicationSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication))")
+	guard := strings.Index(text, "if codeApplication != nil && (!c.checkApplicationSignupSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication))")
 	mutation := strings.Index(text, "affected, err := object.AddUser(user")
 	if guard < 0 || mutation < 0 || guard > mutation {
 		t.Fatal("OAuth signup sign-in and membership guards must run before account creation")

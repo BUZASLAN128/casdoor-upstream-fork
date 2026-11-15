@@ -131,6 +131,15 @@ func (c *ApiController) checkApplicationSignin(application *object.Application, 
 	return true
 }
 
+func (c *ApiController) checkApplicationSignupSignin(application *object.Application, user *object.User) bool {
+	err := object.CheckApplicationSigninForSignup(application, user, util.GetClientIpFromRequest(c.Ctx.Request), c.GetAcceptLanguage())
+	if err != nil {
+		c.ResponseError(err.Error())
+		return false
+	}
+	return true
+}
+
 // getSessionAuthTime returns when the user of the session last entered credentials, 0 if unknown
 func (c *ApiController) getSessionAuthTime() int64 {
 	if authTime, ok := c.GetSession("authTime").(int64); ok {
