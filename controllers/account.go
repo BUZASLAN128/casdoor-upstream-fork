@@ -79,9 +79,11 @@ type LaravelResponse struct {
 }
 
 func isSignupOAuthApplication(signupApplication *object.Application, targetApplication *object.Application, clientId string) bool {
-	return signupApplication != nil && targetApplication != nil &&
-		targetApplication.GetId() == signupApplication.GetId() &&
-		targetApplication.ClientId == clientId
+	if signupApplication == nil || targetApplication == nil || targetApplication.GetId() != signupApplication.GetId() || targetApplication.Organization != signupApplication.Organization {
+		return false
+	}
+	realClientId, _ := util.GetSharedOrgFromApp(clientId)
+	return targetApplication.ClientId == realClientId
 }
 
 // Signup
@@ -312,6 +314,9 @@ func (c *ApiController) Signup() {
 	if application.DefaultTag != "" && user.Tag == "" {
 		user.Tag = application.DefaultTag
 	}
+	if codeApplication != nil && (!c.checkApplicationSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication)) {
+		return
+	}
 
 	affected, err := object.AddUser(user, c.GetAcceptLanguage())
 	if err != nil {
@@ -338,10 +343,6 @@ func (c *ApiController) Signup() {
 			return
 		}
 	}
-	if codeApplication != nil && (!c.checkApplicationSignin(codeApplication, user) || !c.checkUserOfApplication(user, codeApplication)) {
-		return
-	}
-
 	if user.Type == "normal-user" {
 		c.renewSessionIdForUser(user.GetId())
 		c.SetSessionUsername(user.GetId())
@@ -397,7 +398,7 @@ func (c *ApiController) Signup() {
 			return
 		}
 
-		code, err := object.GetOAuthCode(userId, codeApplication.ClientId, "", "password", responseType, redirectUri, scope, state, nonce, codeChallenge, "", c.Ctx.Input.CruSession.SessionID(context.Background()), time.Now().Unix(), c.Ctx.Request.Host, c.GetAcceptLanguage())
+		code, err := object.GetOAuthCode(userId, clientId, "", "password", responseType, redirectUri, scope, state, nonce, codeChallenge, "", c.Ctx.Input.CruSession.SessionID(context.Background()), time.Now().Unix(), c.Ctx.Request.Host, c.GetAcceptLanguage())
 		if err != nil {
 			c.ResponseError(err.Error(), nil)
 			return

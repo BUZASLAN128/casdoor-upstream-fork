@@ -94,6 +94,7 @@ func runServer() {
 	object.InitCleanupDeviceAuthMap()
 	object.InitCleanupCasTickets()
 	object.InitSamlAssertionStore()
+	object.InitDPoPProofReplayStore()
 	object.InitExpirePermissions()
 	object.InitUpdateSubscriptionStates()
 	object.InitSecurityPolicyJobs()

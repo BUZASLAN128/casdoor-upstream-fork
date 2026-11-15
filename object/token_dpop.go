@@ -148,6 +148,17 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 		}
 	}
 
+	// A valid proof is single-use. Scope the replay key to the signing key so
+	// unrelated clients may choose the same jti, and hash it before persistence.
+	replayDigest := sha256.Sum256([]byte(jkt + "\x00" + claims.Jti))
+	replayed, err := DPoPProofReplayStore.MarkUsed(base64.RawURLEncoding.EncodeToString(replayDigest[:]), time.Duration(dpopMaxAgeSeconds)*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("failed to record DPoP proof identifier: %w", err)
+	}
+	if replayed {
+		return "", fmt.Errorf("DPoP proof identifier has already been used")
+	}
+
 	return jkt, nil
 }
 

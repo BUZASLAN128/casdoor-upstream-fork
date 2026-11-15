@@ -56,6 +56,14 @@ type PushChallenge struct {
 var pushChallenges sync.Map
 var pushChallengeApprovals sync.Map
 
+func expirePushChallengeLocked(challenge *PushChallenge, now time.Time) bool {
+	if (challenge.Status == PushChallengePending || challenge.Status == PushChallengeApproved) && !now.Before(challenge.CreatedTime.Add(pushChallengeLifetime)) {
+		challenge.Status = PushChallengeExpired
+		return true
+	}
+	return challenge.Status == PushChallengeExpired
+}
+
 func deletePushChallenge(challenge *PushChallenge) {
 	if challenge == nil {
 		return
@@ -80,9 +88,7 @@ func getPushChallenge(id string) *PushChallenge {
 	challenge := value.(*PushChallenge)
 	challenge.mu.Lock()
 	defer challenge.mu.Unlock()
-	if (challenge.Status == PushChallengePending || challenge.Status == PushChallengeApproved) && time.Since(challenge.CreatedTime) > pushChallengeLifetime {
-		challenge.Status = PushChallengeExpired
-	}
+	expirePushChallengeLocked(challenge, time.Now())
 	if time.Since(challenge.CreatedTime) > 2*pushChallengeLifetime {
 		deletePushChallenge(challenge)
 		return nil
@@ -129,6 +135,9 @@ func AnswerPushChallenge(approvalToken string, approve bool) (*PushChallenge, er
 	}
 	challenge.mu.Lock()
 	defer challenge.mu.Unlock()
+	if expirePushChallengeLocked(challenge, time.Now()) {
+		return copyPushChallengeLocked(challenge), errors.New("the sign-in request doesn't exist or has expired")
+	}
 	if challenge.Status != PushChallengePending {
 		return copyPushChallengeLocked(challenge), fmt.Errorf("the sign-in request has been %s", challenge.Status)
 	}
@@ -149,6 +158,9 @@ func consumePushChallenge(id string, userId string, provider string, receiver st
 	}
 	challenge.mu.Lock()
 	defer challenge.mu.Unlock()
+	if expirePushChallengeLocked(challenge, time.Now()) {
+		return errors.New("the sign-in request has expired, please send it again")
+	}
 	if challenge.UserId != userId || challenge.Provider != provider || challenge.Receiver != receiver {
 		return errors.New("the sign-in request doesn't exist or has expired, please send it again")
 	}

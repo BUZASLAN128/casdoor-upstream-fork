@@ -58,3 +58,28 @@ func TestCerberusSecurityFederatedTokenExchangeRejectsConfirmationClaims(t *test
 		t.Fatal("unbound federated claims were treated as sender constrained")
 	}
 }
+
+func TestCerberusSecurityFederatedTokenExchangeRejectsDeletedUsers(t *testing.T) {
+	if tokenError := getInactiveUserTokenError(&User{IsDeleted: true}); tokenError == nil || tokenError.Error != InvalidGrant {
+		t.Fatalf("deleted federated user error = %#v, want invalid_grant", tokenError)
+	}
+	if tokenError := getInactiveUserTokenError(&User{}); tokenError != nil {
+		t.Fatalf("active federated user was rejected: %#v", tokenError)
+	}
+}
+
+func TestCerberusSecurityApplicationTokenRecordIsNotBoundToUserRow(t *testing.T) {
+	token := &Token{
+		Application:  "workload-app",
+		Organization: "tenant-a",
+		User:         "",
+		GrantType:    "urn:ietf:params:oauth:grant-type:token-exchange",
+	}
+	active, err := token.IsUserActive()
+	if err != nil {
+		t.Fatalf("application token activity check: %v", err)
+	}
+	if !active {
+		t.Fatal("application token was treated as an absent end-user token")
+	}
+}

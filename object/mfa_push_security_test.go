@@ -141,3 +141,29 @@ func TestCerberusSecurityPushMfaApprovalDoesNotExtendExpiry(t *testing.T) {
 		t.Fatal("an approval was consumed after its five-minute lifetime")
 	}
 }
+
+func TestCerberusSecurityPushMfaTransitionsRecheckExpiryUnderLock(t *testing.T) {
+	challenge := &PushChallenge{
+		Id:            "transition-expired-polling-id",
+		ApprovalToken: "transition-expired-approval-token",
+		UserId:        "org-a/alice",
+		Provider:      "admin/provider",
+		Receiver:      "receiver",
+		Status:        PushChallengePending,
+		CreatedTime:   time.Now().Add(-pushChallengeLifetime),
+	}
+	pushChallenges.Store(challenge.Id, challenge)
+	pushChallengeApprovals.Store(challenge.ApprovalToken, challenge.Id)
+	defer deletePushChallenge(challenge)
+
+	answered, err := AnswerPushChallenge(challenge.ApprovalToken, true)
+	if err == nil {
+		t.Fatal("an approval transition succeeded at the expiry boundary")
+	}
+	if answered == nil || answered.Status != PushChallengeExpired {
+		t.Fatalf("expired approval returned %#v, want Expired", answered)
+	}
+	if err = consumePushChallenge(challenge.Id, challenge.UserId, challenge.Provider, challenge.Receiver); err == nil {
+		t.Fatal("an expired challenge was consumed")
+	}
+}

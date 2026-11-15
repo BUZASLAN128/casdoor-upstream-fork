@@ -15,6 +15,7 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -58,33 +59,22 @@ func setUserStringField(user *User, field string, value string) {
 	reflect.ValueOf(user).Elem().FieldByName(field).SetString(value)
 }
 
-// clearMergedUserLoginIdentifiers removes every login selector transferred away from a
-// soft-deleted merge source. Lookup helpers do not consistently exclude deleted rows, so
-// retaining these values can make a later sign-in resolve to the deleted account instead
-// of the account that kept the identifiers.
-func clearMergedUserLoginIdentifiers(user *User) []string {
-	columns := []string{"email", "email_verified", "phone", "country_code"}
-	user.Email = ""
-	user.EmailVerified = false
-	user.Phone = ""
-	user.CountryCode = ""
+func getUserMergeDeletionPolicyError(organization *Organization) error {
+	if organization == nil {
+		return errors.New("the organization does not exist")
+	}
+	if organization.EnableSoftDeletion {
+		return errors.New("account merge is disabled when soft deletion is enabled")
+	}
+	return nil
+}
 
-	for _, field := range userProviderFields {
-		setUserStringField(user, field, "")
-		columns = append(columns, ormerColumnName(field))
+func checkUserMergeDeletionPolicy(owner string) error {
+	organization, err := getOrganization("admin", owner)
+	if err != nil {
+		return err
 	}
-
-	propertiesChanged := false
-	for key := range user.Properties {
-		if strings.HasPrefix(strings.ToLower(key), "oauth_") {
-			delete(user.Properties, key)
-			propertiesChanged = true
-		}
-	}
-	if propertiesChanged {
-		columns = append(columns, "properties")
-	}
-	return columns
+	return getUserMergeDeletionPolicyError(organization)
 }
 
 // GetUserMergeError tells why the account "from" can't be merged into the account "into",
@@ -95,6 +85,9 @@ func GetUserMergeError(from *User, into *User, lang string) string {
 	}
 	if from.IsAdminUser() || into.IsAdminUser() || from.IsDeleted || into.IsDeleted || from.IsForbidden || into.IsForbidden {
 		return i18n.Translate(lang, "auth:Unauthorized operation")
+	}
+	if err := checkUserMergeDeletionPolicy(from.Owner); err != nil {
+		return err.Error()
 	}
 	if from.BalanceCredit != 0 || (from.Balance != 0 && getUserBalanceCurrency(from) != getUserBalanceCurrency(into)) {
 		return i18n.Translate(lang, "auth:Unauthorized operation")
@@ -157,6 +150,13 @@ func GetMergedUsers(user *User) []string {
 // MergeUser moves the third-party accounts, email, phone and balance of "from" into "into", fills the
 // profile fields "into" leaves empty, lists "from" in the mergedUsers property of "into", then deletes "from"
 func MergeUser(from *User, into *User) error {
+	// A soft-deleted source would retain login selectors unless the entire transfer,
+	// retirement and destination update were atomic. The shared engine helpers used by
+	// this flow do not provide that transaction, so fail before moving links or balances.
+	if err := checkUserMergeDeletionPolicy(from.Owner); err != nil {
+		return err
+	}
+
 	columns := []string{}
 	for _, field := range userProviderFields {
 		value := getUserStringField(from, field)
@@ -227,13 +227,6 @@ func MergeUser(from *User, into *User) error {
 	if err != nil {
 		return err
 	}
-	if from.IsDeleted {
-		_, err = UpdateUser(from.GetId(), from, clearMergedUserLoginIdentifiers(from), true)
-		if err != nil {
-			return err
-		}
-	}
-
 	_, err = UpdateUser(into.GetId(), into, columns, true)
 	return err
 }

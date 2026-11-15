@@ -1123,11 +1123,8 @@ func getFederatedTokenExchangeToken(application *Application, credential *Federa
 		}
 	} else {
 		organization = user.Owner
-		if user.IsForbidden {
-			return nil, &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
-			}, nil
+		if tokenError := getInactiveUserTokenError(user); tokenError != nil {
+			return nil, tokenError, nil
 		}
 	}
 
@@ -1177,13 +1174,19 @@ func getFederatedTokenExchangeToken(application *Application, credential *Federa
 		idToken = ""
 	}
 
+	storedUser := user.Name
+	if isApplication {
+		// Application subjects do not have a corresponding user row. Keeping the
+		// application name in Token.User makes IsUserActive reject the token.
+		storedUser = ""
+	}
 	token := &Token{
 		Owner:        application.Owner,
 		Name:         tokenName,
 		CreatedTime:  util.GetCurrentTime(),
 		Application:  application.Name,
 		Organization: organization,
-		User:         user.Name,
+		User:         storedUser,
 		Code:         util.GenerateAuthorizationCode(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
