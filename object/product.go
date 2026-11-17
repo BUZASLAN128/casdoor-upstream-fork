@@ -174,6 +174,13 @@ func UpdateProduct(id string, product *Product) (bool, error) {
 	if usedByPlan {
 		return rollback(fmt.Errorf("the product cannot be updated directly while a plan depends on it: %s", id))
 	}
+	reserved, err := unresolvedGroupProductReservation(session, owner, name)
+	if err != nil {
+		return rollback(err)
+	}
+	if err := validateReservedProductMutation(stored, &updated, reserved); err != nil {
+		return rollback(err)
+	}
 	affected, err := session.ID(core.PK{owner, name}).AllCols().Update(&updated)
 	if err != nil {
 		return rollback(err)
@@ -263,11 +270,24 @@ func DeleteProduct(product *Product) (bool, error) {
 	if usedByPlan {
 		return rollback(fmt.Errorf("the product cannot be deleted while a plan depends on it: %s", product.GetId()))
 	}
+	canonical, err := checkoutStockProductForUpdate(session, product.Owner, product.Name)
+	if err != nil || canonical == nil {
+		_ = session.Rollback()
+		return false, err
+	}
+	reserved, err := unresolvedGroupProductReservation(session, product.Owner, product.Name)
+	if err != nil {
+		return rollback(err)
+	}
+	if reserved {
+		return rollback(ErrGroupCheckoutConflict)
+	}
 	affected, err := session.ID(core.PK{product.Owner, product.Name}).Delete(&Product{})
 	if err != nil {
 		return rollback(err)
 	}
-	if err = session.Commit(); err != nil {
+
+	if err := session.Commit(); err != nil {
 		return rollback(err)
 	}
 	return affected != 0, nil

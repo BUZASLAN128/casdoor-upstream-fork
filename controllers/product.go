@@ -185,9 +185,13 @@ func (c *ApiController) BuyProduct() {
 	planName := c.Ctx.Input.Query("planName")
 	paidUserName := c.Ctx.Input.Query("userName")
 
-	owner, _, err := util.GetOwnerAndNameFromIdWithError(id)
+	owner, productName, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+	if err := object.CheckTenantCheckoutRequest(c.GetSessionUsername(), owner, "", []object.ProductInfo{{Name: productName, PricingName: pricingName, PlanName: planName, Quantity: 1}}); err != nil {
+		c.respondGroupCheckoutError(err)
 		return
 	}
 
@@ -222,7 +226,7 @@ func (c *ApiController) BuyProduct() {
 
 	payment, attachInfo, err := object.BuyProduct(id, user, providerName, pricingName, planName, host, paymentEnv, customPrice, c.GetAcceptLanguage(), couponCode)
 	if err != nil {
-		c.ResponseError(err.Error())
+		c.respondGroupCheckoutError(err)
 		return
 	}
 

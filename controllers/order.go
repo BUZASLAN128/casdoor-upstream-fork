@@ -139,6 +139,10 @@ func (c *ApiController) GetOrder() {
 		c.ResponseError(err.Error())
 		return
 	}
+	if order != nil && order.Group != "" && c.GetSessionUsername() != util.GetId(order.Owner, order.User) {
+		c.ResponseError("Forbidden")
+		return
+	}
 
 	if order != nil && !c.IsAdminOfOrganization(order.Owner) {
 		sessionUser := c.GetSessionUsername()
@@ -173,6 +177,11 @@ func (c *ApiController) UpdateOrder() {
 		c.ResponseError(err.Error())
 		return
 	}
+	stored, err := object.GetOrder(id)
+	if err != nil || order.Group != "" || (stored != nil && stored.Group != "") {
+		c.ResponseError("tenant checkout orders cannot be edited")
+		return
+	}
 
 	c.Data["json"] = wrapActionResponse(object.UpdateOrder(id, &order))
 	c.ServeJSON()
@@ -190,6 +199,10 @@ func (c *ApiController) AddOrder() {
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &order)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+	if order.Group != "" {
+		c.ResponseError("tenant checkout requires the trusted place-order operation")
 		return
 	}
 

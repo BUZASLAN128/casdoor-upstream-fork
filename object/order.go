@@ -35,6 +35,11 @@ type Order struct {
 
 	// User Info
 	User string `xorm:"varchar(100)" json:"user"`
+	// Group is bound only by the trusted tenant checkout operation.
+	Group string `xorm:"varchar(100) index" json:"group"`
+	// Only the trusted Group quote/claim path writes these server terms.
+	CheckoutTerms    *GroupCheckoutTerms `xorm:"json" json:"checkoutTerms,omitempty"`
+	CheckoutRevision int64               `xorm:"notnull default 0" json:"checkoutRevision"`
 
 	// Payment Info
 	Payment  string  `xorm:"varchar(100)" json:"payment"`
@@ -128,6 +133,9 @@ func GetOrder(id string) (*Order, error) {
 }
 
 func UpdateOrder(id string, order *Order) (bool, error) {
+	if order.CheckoutTerms != nil || order.CheckoutRevision != 0 {
+		return false, ErrGroupCheckoutConflict
+	}
 	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		return false, err
@@ -138,6 +146,14 @@ func UpdateOrder(id string, order *Order) (bool, error) {
 		return false, err
 	} else if o == nil {
 		return false, nil
+	}
+	if o.Group != order.Group || (o.Group != "" && (o.Owner != order.Owner || o.Name != order.Name || o.User != order.User || !slices.Equal(o.Products, order.Products) || !slices.Equal(o.ProductInfos, order.ProductInfos) || o.Price != order.Price || o.Currency != order.Currency)) {
+		return false, fmt.Errorf("tenant checkout context is immutable")
+	}
+
+	// Group lifecycle/link writes only run under the canonical checkout locks.
+	if o.Group != "" {
+		return false, ErrGroupCheckoutConflict
 	}
 
 	if o.State != order.State {
@@ -189,6 +205,9 @@ func UpdateOrder(id string, order *Order) (bool, error) {
 }
 
 func AddOrder(order *Order) (bool, error) {
+	if order.CheckoutTerms != nil || order.CheckoutRevision != 0 {
+		return false, ErrGroupCheckoutConflict
+	}
 	// orders created from the UI only carry the product names, so the product infos and
 	// the price need to be filled in here, the same way UpdateOrder() does it
 	if len(order.Products) > 0 && len(order.ProductInfos) == 0 {
@@ -224,6 +243,14 @@ func AddOrder(order *Order) (bool, error) {
 }
 
 func DeleteOrder(order *Order) (bool, error) {
+	stored, err := GetOrder(order.GetId())
+	if err != nil {
+		return false, err
+	}
+	if stored != nil && stored.Group != "" {
+		return false, ErrGroupCheckoutConflict
+	}
+
 	affected, err := ormer.Engine.ID(core.PK{order.Owner, order.Name}).Delete(&Order{})
 	if err != nil {
 		return false, err

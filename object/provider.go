@@ -433,6 +433,12 @@ func (p *Provider) getActionConfig() *action.Config {
 }
 
 func GetPaymentProvider(p *Provider) (pp.PaymentProvider, error) {
+	if p == nil {
+		return nil, fmt.Errorf("payment provider does not exist")
+	}
+	if err := checkDummyPayment(p.Type); err != nil {
+		return nil, err
+	}
 	cert := &Cert{}
 	if p.Cert != "" {
 		var err error

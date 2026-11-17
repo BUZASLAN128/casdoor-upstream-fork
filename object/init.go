@@ -30,20 +30,25 @@ import (
 )
 
 func InitDb() {
-	existed := initBuiltInOrganization()
-	if !existed {
-		initBuiltInPermission()
-		initBuiltInProvider()
-		initBuiltInUser()
-		initBuiltInApplication()
-		initBuiltInLdap()
+	// A fresh configured password must be valid before the first seed write.
+	err := withInitialBuiltInAdminPassword(conf.GetConfigString("initialBuiltInAdminPasswordFile"), getOrganization, readInitialBuiltInAdminPassword, func(password string) {
+		existed := initBuiltInOrganization()
+		if !existed {
+			initBuiltInPermission()
+			initBuiltInProvider()
+			initBuiltInUser(password, getUser, AddUser)
+			initBuiltInApplication()
+			initBuiltInLdap()
+		}
+	})
+	if err != nil {
+		panic(err)
 	}
 
-	// cert-built-in signs the tokens of the applications without a cert, including app-built-in, so nobody
-	// can sign in when it is missing, e.g. after an earlier start failed halfway
+	// Repair a missing signing certificate even after a partially completed seed.
 	initBuiltInCert()
 
-	existed = initBuiltInApiModel()
+	existed := initBuiltInApiModel()
 	if !existed {
 		initBuiltInApiAdapter()
 		initBuiltInApiEnforcer()
@@ -167,13 +172,20 @@ func initBuiltInOrganization() bool {
 	return false
 }
 
-func initBuiltInUser() {
-	user, err := getUser("built-in", "admin")
+func initBuiltInUser(initialPassword string, findUser func(string, string) (*User, error), addUser func(*User, string) (bool, error)) {
+	user, err := findUser("built-in", "admin")
 	if err != nil {
+		if initialPassword != "" {
+			panic(errInitialBuiltInAdminCreation)
+		}
 		panic(err)
 	}
 	if user != nil {
 		return
+	}
+	password := getInitAdminPassword()
+	if initialPassword != "" {
+		password = initialPassword
 	}
 
 	user = &User{
@@ -182,7 +194,7 @@ func initBuiltInUser() {
 		CreatedTime:       util.GetCurrentTime(),
 		Id:                util.GenerateId(),
 		Type:              "normal-user",
-		Password:          getInitAdminPassword(),
+		Password:          password,
 		DisplayName:       "Admin",
 		Avatar:            fmt.Sprintf("%s/img/casbin.svg", conf.GetConfigString("staticBaseUrl")),
 		Email:             "admin@example.com",
@@ -202,7 +214,10 @@ func initBuiltInUser() {
 		CreatedIp:         "127.0.0.1",
 		Properties:        make(map[string]string),
 	}
-	_, err = AddUser(user, "en")
+	affected, err := addUser(user, "en")
+	if initialPassword != "" && (err != nil || !affected) {
+		panic(errInitialBuiltInAdminCreation)
+	}
 	if err != nil {
 		panic(err)
 	}

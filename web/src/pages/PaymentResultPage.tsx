@@ -1,7 +1,7 @@
 import * as React from "react";
 import i18next from "i18next";
 import {AlertTriangle, CheckCircle2, Info, XCircle} from "lucide-react";
-import {useNavigate, useParams, useSearchParams} from "react-router-dom";
+import {useLocation, useNavigate, useParams, useSearchParams} from "react-router-dom";
 import {Button} from "@/components/ui/button";
 import {Loading} from "@/components/common/Loading";
 import {useAccount} from "@/hooks/use-account";
@@ -13,6 +13,9 @@ import * as Setting from "@/lib/setting";
 
 /** Payment types the frontend nudges with /api/notify-payment while they are pending. */
 const NOTIFIABLE = ["PayPal", "Stripe", "AirWallex", "Alipay", "WeChat Pay", "Balance", "Dummy"];
+
+// The only result a signed-out payer is sent back to after login; LoginPage's TENANT_RESULT_RETURN is the same pattern.
+const TENANT_RESULT = /^\/buy-plan\/[^/?#]+\/[^/?#]+\/result\?payment=payment_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type Status = "success" | "info" | "warning" | "error";
 
@@ -43,17 +46,30 @@ function Result({status, title, subTitle, extra}: {status: Status; title: React.
 export default function PaymentResultPage() {
   const params = useParams();
   const [search] = useSearchParams();
+  const location = useLocation();
   const navigate = useNavigate();
-  const {account} = useAccount();
+  const {account, loading} = useAccount();
 
   const owner = params.organizationName ?? params.owner ?? "";
   const pricingName = params.pricingName ?? "";
   const subscriptionName = search.get("subscription");
 
-  const [paymentName, setPaymentName] = React.useState(params.paymentName ?? "");
+  // /buy-plan/:owner/:pricingName/result?payment= is where a tenant checkout returns, outside the console
+  const [paymentName, setPaymentName] = React.useState(params.paymentName ?? (pricingName ? search.get("payment") ?? "" : ""));
   const [payment, setPayment] = React.useState<any>(null);
   const [user, setUser] = React.useState<any>(null);
   const [nonce, setNonce] = React.useState(0);
+  const [failed, setFailed] = React.useState(false);
+
+  const here = location.pathname + location.search;
+  const loginReturn = !loading && account === null && TENANT_RESULT.test(here);
+
+  React.useEffect(() => {
+    if (loginReturn) {
+      sessionStorage.setItem("from", here);
+      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true});
+    }
+  }, [loginReturn, here, navigate, owner]);
 
   // resolve the payment name from the subscription when arriving from /buy-plan
   React.useEffect(() => {
@@ -84,7 +100,7 @@ export default function PaymentResultPage() {
   }, [owner, pricingName, subscriptionName]);
 
   React.useEffect(() => {
-    if (!owner || !paymentName) {
+    if (!owner || !paymentName || loading || loginReturn) {
       return;
     }
     let cancelled = false;
@@ -95,12 +111,16 @@ export default function PaymentResultPage() {
         if (cancelled) {
           return;
         }
-        if (res.status !== "ok") {
-          Setting.showMessage("error", res.msg);
+        // another account's payment (or none) is refused, never polled or notified
+        if (res.status !== "ok" || !res.data) {
+          setFailed(true);
           return;
         }
         const next = res.data;
         setPayment(next);
+        if (account && next.owner === account.owner && next.user === account.name && sessionStorage.getItem("from") === here) {
+          sessionStorage.removeItem("from");
+        }
 
         if (next.state === "Created") {
           timer = window.setTimeout(async() => {
@@ -124,7 +144,29 @@ export default function PaymentResultPage() {
         window.clearTimeout(timer);
       }
     };
-  }, [owner, paymentName, nonce, account]);
+  }, [owner, paymentName, nonce, account, loading, loginReturn, here]);
+
+  // a console-disabled payer cannot open the order pages; the organization's own site is the way back
+  const consoleClosed = account?.organization?.disableConsole && !Setting.isLocalAdminUser(account);
+  const homeUrl = String(account?.organization?.websiteUrl ?? "");
+  const backToSite = /^https?:\/\//.test(homeUrl) ? (
+    <Button onClick={() => Setting.goToLink(homeUrl)}>{i18next.t("payment:Back to Cerberus")}</Button>
+  ) : null;
+  const orderList = (
+    <Button variant="outline" onClick={() => navigate("/orders")}>
+      {i18next.t("order:Return to Order List")}
+    </Button>
+  );
+
+  if (failed) {
+    return (
+      <Result
+        status="error"
+        title={i18next.t("general:Sorry, you do not have permission to access this page or logged in status invalid.")}
+        extra={account ? (consoleClosed ? backToSite : orderList) : null}
+      />
+    );
+  }
 
   if (payment === null) {
     return <Loading />;
@@ -138,15 +180,15 @@ export default function PaymentResultPage() {
     }
   };
 
-  const actions = (
+  const actions = consoleClosed ? backToSite : (
     <>
       <Button onClick={goToViewOrder}>{i18next.t("order:View Order")}</Button>
-      <Button variant="outline" onClick={() => navigate("/orders")}>
-        {i18next.t("order:Return to Order List")}
-      </Button>
+      {orderList}
     </>
   );
-  const subTitle = i18next.t("payment:You can view your order details or return to the order list");
+  const subTitle = consoleClosed
+    ? i18next.t("payment:The plan status shows under Service summary on your Cerberus Dashboard")
+    : i18next.t("payment:You can view your order details or return to the order list");
   const currency = Setting.getCurrencyText(payment.currency);
 
   if (payment.state === "Paid") {
