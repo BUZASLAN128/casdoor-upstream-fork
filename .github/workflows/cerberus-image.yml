@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "codex/casdoor-security-*"
+      - "codex/casdoor-v4290-cockroach"
     paths:
       - ".github/workflows/cerberus-image.yml"
       - "Dockerfile.cerberus"
@@ -49,11 +50,11 @@ jobs:
           build-args: |
             SOURCE_REVISION=${{ github.sha }}
           tags: |
-            ghcr.io/buzaslan129/casdoor-cockroach:4.27.1-cerberus.1-${{ github.sha }}
+            ghcr.io/buzaslan129/casdoor-cockroach:4.29.0-cerberus.1-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=4.27.1-cerberus.1
+            org.opencontainers.image.version=4.29.0-cerberus.1
           cache-from: type=gha,scope=cerberus-casdoor-amd64
           cache-to: type=gha,mode=max,scope=cerberus-casdoor-amd64
           provenance: mode=max
