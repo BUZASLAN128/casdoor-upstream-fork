@@ -163,31 +163,64 @@ func loadGroupTimeline(session *xorm.Session, owner, group string, now time.Time
 		seenPayments[payment.Name] = true
 		periods = append(periods, period)
 	}
-	paid := []*Payment{}
-	if err := session.Where("owner = ?", owner).And(fmt.Sprintf("%s = ?", quoteColumn("group")), group).And("state = ?", pp.PaymentStatePaid).Limit(1025).Find(&paid); err != nil {
+	if err := validateUnboundGroupPayments(session, owner, group, seenPayments); err != nil {
 		return nil, err
 	}
-	if len(paid) > 1024 {
-		return nil, ErrGroupCheckoutConflict
-	}
-	for _, payment := range paid {
-		if seenPayments[payment.Name] {
-			continue
-		}
-		order := &Order{}
-		found, err := session.ID(core.PK{owner, payment.Order}).Get(order)
-		if err != nil {
-			return nil, err
-		}
-		// A package is a purchase, not a paid period. Other unmatched Paid
-		// payments still make the timeline ambiguous.
-		if !found || order.State != "Paid" || order.CheckoutRevision < 3 || !payment.GroupStockReserved ||
-			!isTenantPackageCheckout(order.ProductInfos) || validateGroupOrderTerms(order, true) != nil ||
-			validateGroupPayment(order, payment) != nil {
-			return nil, ErrGroupCheckoutConflict
-		}
-	}
 	return groupTimeline(periods, now)
+}
+
+// The subscription read bounds the plan payments. Scan the remaining Paid
+// payments in name order so package volume does not consume that bound.
+func validateUnboundGroupPayments(session *xorm.Session, owner, group string, planPayments map[string]bool) error {
+	const pageSize = 256
+	var after string
+	for {
+		var paid []*Payment
+		query := session.Where("owner = ?", owner).And(quoteColumn("group")+" = ?", group).And("state = ?", pp.PaymentStatePaid)
+		if after != "" {
+			query.And("name > ?", after)
+		}
+		if err := query.Asc("name").Limit(pageSize).Find(&paid); err != nil {
+			return err
+		}
+		unbound := make([]*Payment, 0, len(paid))
+		orderNames := make([]string, 0, len(paid))
+		for _, payment := range paid {
+			if !planPayments[payment.Name] {
+				unbound = append(unbound, payment)
+				orderNames = append(orderNames, payment.Order)
+			}
+		}
+		if len(unbound) > 0 {
+			var orders []*Order
+			if err := session.Where("owner = ?", owner).In("name", orderNames).Find(&orders); err != nil {
+				return err
+			}
+			byName := make(map[string]*Order, len(orders))
+			for _, order := range orders {
+				byName[order.Name] = order
+			}
+			for _, payment := range unbound {
+				if err := validatePaidPackagePayment(byName[payment.Order], payment); err != nil {
+					return err
+				}
+			}
+		}
+		if len(paid) < pageSize {
+			return nil
+		}
+		after = paid[len(paid)-1].Name
+	}
+}
+
+func validatePaidPackagePayment(order *Order, payment *Payment) error {
+	if order == nil || order.State != "Paid" || order.CheckoutRevision < 3 ||
+		payment.State != pp.PaymentStatePaid || !payment.GroupStockReserved ||
+		!isTenantPackageCheckout(order.ProductInfos) || validateGroupOrderTerms(order, true) != nil ||
+		validateGroupPayment(order, payment) != nil {
+		return ErrGroupCheckoutConflict
+	}
+	return nil
 }
 
 func groupOpenOrders(session *xorm.Session, owner, group string) ([]*Order, error) {

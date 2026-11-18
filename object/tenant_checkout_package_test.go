@@ -121,6 +121,56 @@ func TestTenantPackageCheckoutDummyIntentAndReadbackWithoutPlan(t *testing.T) {
 	}
 }
 
+func paidPackageFixture(owner, name string) (Order, Payment) {
+	sku := fmt.Sprintf("ai-budget-%x", sha256.Sum256([]byte("starter@v1")))
+	order := Order{
+		Owner: owner, Name: name + "-order", Group: "tenant", User: "payer",
+		State: "Paid", CheckoutRevision: 3, Payment: name, Price: 5, Currency: "USD",
+		CheckoutTerms: &GroupCheckoutTerms{Version: 1, Kind: "package", PreviousPeriodRevision: "none"},
+		Products:      []string{sku},
+		ProductInfos:  []ProductInfo{{Name: sku, Quantity: 1}},
+	}
+	payment := Payment{
+		Owner: owner, Name: name, Group: order.Group, User: order.User, Order: order.Name,
+		State: pp.PaymentStatePaid, GroupStockReserved: true, Price: order.Price, Currency: order.Currency,
+		Products: []string{sku},
+	}
+	return order, payment
+}
+
+func TestTenantPackageCheckoutUnboundPaidPaymentRequiresSettledPackage(t *testing.T) {
+	order, payment := paidPackageFixture("org", "payment")
+	if err := validatePaidPackagePayment(&order, &payment); err != nil {
+		t.Fatalf("settled package must be admitted: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*Order, *Payment)
+	}{
+		{"plan order", func(o *Order, p *Payment) {
+			o.Products, p.Products = []string{"product"}, []string{"product"}
+			o.ProductInfos = []ProductInfo{{Name: "product", Quantity: 1, PricingName: "pricing", PlanName: "plan"}}
+			o.CheckoutTerms = &GroupCheckoutTerms{
+				Version: 1, Kind: "fresh", PreviousPeriodRevision: "none", Period: PeriodMonthly,
+				StartTime: "2026-11-01T00:00:00Z", EndTime: "2026-12-01T00:00:00Z",
+			}
+		}},
+		{"order not paid", func(o *Order, p *Payment) { o.State = "Processing" }},
+		{"revision below three", func(o *Order, p *Payment) { o.CheckoutRevision = 2 }},
+		{"missing reservation", func(o *Order, p *Payment) { p.GroupStockReserved = false }},
+		{"altered terms", func(o *Order, p *Payment) { o.CheckoutTerms.PreviousPeriodRevision = "changed" }},
+		{"payment mismatch", func(o *Order, p *Payment) { p.Price++ }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			order, payment := paidPackageFixture("org", "payment")
+			tc.change(&order, &payment)
+			if err := validatePaidPackagePayment(&order, &payment); !errors.Is(err, ErrGroupCheckoutConflict) {
+				t.Fatalf("unbound paid payment must conflict: %v", err)
+			}
+		})
+	}
+}
+
 func TestTenantPackageCheckoutMemoryPersistence(t *testing.T) {
 	engine, payer, plan := setupTenantCheckoutMemoryFixture(t)
 	testTenantPackageCheckoutPersistence(t, engine, payer, "app/cerberus", "dummy", plan, false)
@@ -129,6 +179,41 @@ func TestTenantPackageCheckoutMemoryPersistence(t *testing.T) {
 func TestTenantPackageCheckoutPostgresPersistence(t *testing.T) {
 	engine, payer, plan := setupTenantCheckoutReplacementAbuseFixture(t)
 	testTenantPackageCheckoutPersistence(t, engine, payer, "app/"+payer.Owner, payer.Owner+"_dummy", plan, true)
+}
+
+func TestTenantPackageCheckoutPostgresPaidVolumePreservesPlanCheckout(t *testing.T) {
+	engine, payer, plan := setupTenantCheckoutReplacementAbuseFixture(t)
+	owner, principal := payer.Owner, "app/"+payer.Owner
+	const total, batchSize = 1025, 128
+	for start := 0; start < total; start += batchSize {
+		var orders []Order
+		var payments []Payment
+		for i := start; i < min(start+batchSize, total); i++ {
+			order, payment := paidPackageFixture(owner, fmt.Sprintf("top-up-%04d", i))
+			orders, payments = append(orders, order), append(payments, payment)
+		}
+		if n, err := engine.Insert(&orders); err != nil || n != int64(len(orders)) {
+			t.Fatalf("seed settled package orders: count=%d err=%v", n, err)
+		}
+		if n, err := engine.Insert(&payments); err != nil || n != int64(len(payments)) {
+			t.Fatalf("seed settled package payments: count=%d err=%v", n, err)
+		}
+	}
+	status, err := GetGroupCheckout(principal, owner, "tenant", payer.Name, "")
+	if err != nil || !status.PurchaseEligible || status.CurrentSubscription != nil {
+		t.Fatalf("paid packages blocked group checkout: %v", err)
+	}
+	if _, err := PlaceGroupOrder(principal, owner, "tenant", plan, payer, "none"); err != nil {
+		t.Fatalf("paid package volume blocked plan placement: %v", err)
+	}
+	// This payment sorts after the valid pages and has no matching order.
+	_, unbound := paidPackageFixture(owner, "unbound-payment")
+	if _, err := engine.Insert(&unbound); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GetGroupCheckout(principal, owner, "tenant", payer.Name, ""); !errors.Is(err, ErrGroupCheckoutConflict) {
+		t.Fatalf("later unbound payment must conflict: %v", err)
+	}
 }
 
 func testTenantPackageCheckoutPersistence(t *testing.T, engine *xorm.Engine, payer *User, principal, provider string, planInfos []ProductInfo, checkReadModels bool) {
