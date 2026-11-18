@@ -3,9 +3,10 @@ package object
 import (
 	"encoding/json"
 	"errors"
-	"github.com/casdoor/casdoor/pp"
 	"strings"
 	"testing"
+
+	"github.com/casdoor/casdoor/pp"
 )
 
 func TestTenantCheckoutGroupOnlyAllowsBoundTrustedDummy(t *testing.T) {

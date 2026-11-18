@@ -31,7 +31,10 @@ func TestTenantCheckoutHistoryCursorIsBoundedAndTenantScoped(t *testing.T) {
 		t.Fatal("cursor lost native tie-break key")
 	}
 	for _, tc := range []struct{ owner, group, token string }{
-		{"foreign", "tenant", token}, {"org", "foreign", token}, {"org", "tenant", strings.Repeat("x", groupHistoryMaxCursor+1)}, {"org", "tenant", "not base64"},
+		{"foreign", "tenant", token},
+		{"org", "foreign", token},
+		{"org", "tenant", strings.Repeat("x", groupHistoryMaxCursor+1)},
+		{"org", "tenant", "not base64"},
 		{"org", "tenant", base64.RawURLEncoding.EncodeToString([]byte(`{"v":2,"owner":"org","group":"tenant","createdTime":"2026-11-13T10:00:00Z","name":"` + order.Name + `"}`))},
 		{"org", "tenant", base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"owner":"org","group":"tenant","createdTime":"bad","name":"` + order.Name + `"}`))},
 		{"org", "tenant", base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"owner":"org","group":"tenant","createdTime":"2026-11-13T10:00:00Z","name":"payer@example.test"}`))},

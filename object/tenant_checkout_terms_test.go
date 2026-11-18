@@ -229,8 +229,10 @@ func TestTenantCheckoutLateFreshNeedsPositiveBoundPaymentAndMatchingWinnerTime(t
 	t.Setenv("paymentDeploymentEnvironment", "test")
 	t.Setenv("allowDummyPayment", "true")
 	period := checkoutUnitPeriod(t, "2026-11-01T00:00:00Z", "2026-12-01T00:00:00Z")
-	order := &Order{Owner: "org", Name: "order", Group: "tenant", User: "payer", Payment: "payment", Price: 5, Currency: "USD", Products: []string{"product"}, ProductInfos: []ProductInfo{{Name: "product", PricingName: "pricing", PlanName: "plan", Quantity: 1}}, State: "Paid", CheckoutRevision: 3,
-		CheckoutTerms: &GroupCheckoutTerms{Version: 1, Kind: "fresh", PreviousPeriodRevision: "none", StartTime: period.Sub.StartTime, EndTime: period.Sub.EndTime, Period: PeriodMonthly}}
+	order := &Order{
+		Owner: "org", Name: "order", Group: "tenant", User: "payer", Payment: "payment", Price: 5, Currency: "USD", Products: []string{"product"}, ProductInfos: []ProductInfo{{Name: "product", PricingName: "pricing", PlanName: "plan", Quantity: 1}}, State: "Paid", CheckoutRevision: 3,
+		CheckoutTerms: &GroupCheckoutTerms{Version: 1, Kind: "fresh", PreviousPeriodRevision: "none", StartTime: period.Sub.StartTime, EndTime: period.Sub.EndTime, Period: PeriodMonthly},
+	}
 	payment := &Payment{Owner: "org", Name: "payment", Group: "tenant", User: "payer", Order: "order", Price: 5, Currency: "USD", Products: []string{"product"}, Provider: "dummy", Type: "Dummy", State: pp.PaymentStatePaid}
 	period.Order, period.Payment = order, payment
 	period.Sub.State = SubStateExpired

@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/casdoor/casdoor/util"
-	"github.com/xorm-io/xorm/contexts"
 	"net/url"
 	"os"
 	"reflect"
@@ -14,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/casdoor/casdoor/util"
+	"github.com/xorm-io/xorm/contexts"
 
 	"github.com/casdoor/casdoor/pp"
 	"github.com/xorm-io/xorm"
@@ -603,9 +604,11 @@ func TestTenantCheckoutClaimCancelRaceHasOneWinner(t *testing.T) {
 // The Daybreak oracle below keeps its original security outcome: admitting B
 // while A can still settle always fails, even if a later uniqueness check wins.
 // This fixture has NO SQLite fallback and never calls main/InitConfig/Reset.
-const tenantCheckoutAbuseDatabase = "casdoor_commerce_abuse_test_20261112"
-const tenantCheckoutAbuseOptIn = "casdoor-commerce-abuse-20261112"
-const tenantCheckoutAbuseRole = "casdoor_commerce_abuse_20261112"
+const (
+	tenantCheckoutAbuseDatabase = "casdoor_commerce_abuse_test_20261112"
+	tenantCheckoutAbuseOptIn    = "casdoor-commerce-abuse-20261112"
+	tenantCheckoutAbuseRole     = "casdoor_commerce_abuse_20261112"
+)
 
 func validateTenantCheckoutTestDSN(dsn, expectedRole string) error {
 	parsed, err := url.Parse(dsn)
@@ -1166,7 +1169,6 @@ func TestTenantCheckoutLegacyCanceledIntentCannotBeReplacedOrRevived(t *testing.
 	if _, err := PlaceGroupOrder("app/"+payer.Owner, payer.Owner, "tenant", infos, payer, "none"); !errors.Is(err, ErrGroupCheckoutConflict) {
 		t.Fatal("unreviewed historical terminal state permitted redispatch")
 	}
-
 }
 
 func stockFixtureSecondGroup(t *testing.T, engine *xorm.Engine, payer *User, infos []ProductInfo) (*User, *Order) {

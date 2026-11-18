@@ -14,10 +14,12 @@ import (
 
 const tenantPackagePrefix = "ai-budget-"
 
-var tenantPackageSKU = regexp.MustCompile(`^ai-budget-[0-9a-f]{64}$`)
-var tenantPackageComponent = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-var tenantPackageCurrency = regexp.MustCompile(`^[A-Z]{3}$`)
-var tenantPackageTerms = GroupCheckoutTerms{Version: 1, Kind: "package", PreviousPeriodRevision: "none"}
+var (
+	tenantPackageSKU       = regexp.MustCompile(`^ai-budget-[0-9a-f]{64}$`)
+	tenantPackageComponent = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	tenantPackageCurrency  = regexp.MustCompile(`^[A-Z]{3}$`)
+	tenantPackageTerms     = GroupCheckoutTerms{Version: 1, Kind: "package", PreviousPeriodRevision: "none"}
+)
 
 func isTenantPackageCheckout(infos []ProductInfo) bool {
 	if len(infos) != 1 {
