@@ -272,6 +272,7 @@ func addVerificationCodeUser(application *Application, verifyType string, dest s
 	if application.DefaultTag != "" {
 		user.Tag = application.DefaultTag
 	}
+	application.ApplySignupApproval(user)
 
 	affected, err := AddUser(user, lang)
 	if err != nil {

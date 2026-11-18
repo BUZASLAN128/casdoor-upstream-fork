@@ -122,6 +122,12 @@ func InitAPI() {
 	web.Router("/api/get-user-application", &controllers.ApiController{}, "GET:GetUserApplication")
 	web.Router("/api/get-organization-applications", &controllers.ApiController{}, "GET:GetOrganizationApplications")
 	web.Router("/api/update-application", &controllers.ApiController{}, "POST:UpdateApplication")
+	web.Router("/api/upload-applications", &controllers.ApiController{}, "POST:UploadApplications")
+	web.Router("/api/test-provisioning", &controllers.ApiController{}, "POST:TestProvisioning")
+	web.Router("/api/sync-provisioning", &controllers.ApiController{}, "POST:SyncProvisioning")
+	web.Router("/api/retry-provisioning", &controllers.ApiController{}, "POST:RetryProvisioning")
+	web.Router("/api/get-provisioned-accounts", &controllers.ApiController{}, "GET:GetProvisionedAccounts")
+	web.Router("/api/get-provisioning-tasks", &controllers.ApiController{}, "GET:GetProvisioningTasks")
 	web.Router("/api/add-application", &controllers.ApiController{}, "POST:AddApplication")
 	web.Router("/api/delete-application", &controllers.ApiController{}, "POST:DeleteApplication")
 
@@ -156,6 +162,10 @@ func InitAPI() {
 
 	web.Router("/api/get-servers", &controllers.ApiController{}, "GET:GetServers")
 	web.Router("/api/get-mcp-records", &controllers.ApiController{}, "GET:GetMcpRecords")
+	web.Router("/api/get-my-mcp-servers", &controllers.ApiController{}, "GET:GetMyMcpServers")
+	web.Router("/api/get-mcp-approvals", &controllers.ApiController{}, "GET:GetMcpApprovals")
+	web.Router("/api/get-mcp-approval", &controllers.ApiController{}, "GET:GetMcpApproval")
+	web.Router("/api/decide-mcp-approval", &controllers.ApiController{}, "POST:DecideMcpApproval")
 
 	web.Router("/api/verify-records", &controllers.ApiController{}, "GET:VerifyRecords")
 	web.Router("/api/get-compliance-report", &controllers.ApiController{}, "GET:GetComplianceReport")
@@ -493,6 +503,7 @@ func InitAPI() {
 	web.Router("/.well-known/oauth-authorization-server/orgs/:organization", &controllers.RootController{}, "GET:GetOidcDiscoveryByOrganization")
 	web.Router("/.well-known/:application/oauth-protected-resource", &controllers.RootController{}, "GET:GetOauthProtectedResourceMetadataByApplication")
 	web.Router("/.well-known/oauth-protected-resource/api/server/:owner/:name", &controllers.RootController{}, "GET:GetOauthProtectedResourceMetadataByServer")
+	web.Router("/.well-known/oauth-protected-resource/api/mcp/orgs/:organization", &controllers.RootController{}, "GET:GetOauthProtectedResourceMetadataByOrganization")
 
 	web.Router("/cas/:organization/:application/serviceValidate", &controllers.RootController{}, "GET:CasServiceValidate")
 	web.Router("/cas/:organization/:application/proxyValidate", &controllers.RootController{}, "GET:CasProxyValidate")
@@ -506,6 +517,7 @@ func InitAPI() {
 	web.Router("/scim/*", &controllers.RootController{}, "*:HandleScim")
 
 	web.Router("/api/mcp", &mcpself.McpController{}, "POST:HandleMcp")
+	web.Router("/api/mcp/orgs/:organization", &mcpself.McpController{}, "POST:HandleMcp")
 
 	web.Router("/api/faceid-signin-begin", &controllers.ApiController{}, "GET:FaceIDSigninBegin")
 }

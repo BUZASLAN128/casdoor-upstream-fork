@@ -16,8 +16,8 @@ package conf
 
 import "sync/atomic"
 
-// hideCloudPromotion mirrors the global setting of the same name, which lives in the database this package cannot read
-var hideCloudPromotion atomic.Bool
+// showCloudPromotion mirrors the global setting of the same name, which lives in the database this package cannot read
+var showCloudPromotion atomic.Bool
 
 // getEdition is set by the edition package, which reads the license through this package
 var getEdition func() string
@@ -33,8 +33,43 @@ func SetHideUpgradesGetter(getter func() bool) {
 	getHideUpgrades = getter
 }
 
-func SetHideCloudPromotion(hide bool) {
-	hideCloudPromotion.Store(hide)
+func SetShowCloudPromotion(show bool) {
+	showCloudPromotion.Store(show)
+}
+
+type customHtmlAllowed struct {
+	tags []string
+	urls []string
+}
+
+// customHtmlAllowedState mirrors the global settings of what organization admins may use in custom HTML
+var customHtmlAllowedState atomic.Pointer[customHtmlAllowed]
+
+func SetCustomHtmlAllowed(tags []string, urls []string) {
+	customHtmlAllowedState.Store(&customHtmlAllowed{tags: tags, urls: urls})
+}
+
+// GetCustomHtmlAllowedTags returns the elements that organization admins may use in the custom HTML of
+// applications besides the built-in ones, set in the global settings. A script still needs custom scripts enabled.
+func GetCustomHtmlAllowedTags() []string {
+	res := []string{}
+	if state := customHtmlAllowedState.Load(); state != nil {
+		for _, tag := range state.tags {
+			if tag != "script" {
+				res = append(res, tag)
+			}
+		}
+	}
+	return res
+}
+
+// GetCustomHtmlAllowedUrls returns the URL prefixes, set in the global settings, from which organization admins
+// may load images, fonts, frames and other files in the custom HTML and CSS of applications
+func GetCustomHtmlAllowedUrls() []string {
+	if state := customHtmlAllowedState.Load(); state != nil {
+		return state.urls
+	}
+	return nil
 }
 
 type WebConfig struct {
@@ -51,6 +86,8 @@ type WebConfig struct {
 	ShowCloudPromotion  bool   `json:"showCloudPromotion"`
 	Edition             string `json:"edition"`
 	HideUpgrades        bool   `json:"hideUpgrades"`
+
+	CustomHtmlAllowedTags []string `json:"customHtmlAllowedTags"`
 }
 
 func GetWebConfig() *WebConfig {
@@ -91,9 +128,13 @@ func GetWebConfig() *WebConfig {
 	// a licensed deployment has already bought Casdoor, so it is not shown the hosted offering,
 	// while the demo sites keep it in every edition
 	// an on-premise license was sold by contract, its console does not offer the higher editions; the demo sites always do
-	config.HideUpgrades = getHideUpgrades != nil && getHideUpgrades() && !config.ThemeShowcase
+	// and a self-hosted community edition does not offer them until a global admin turns on the promotion
+	config.HideUpgrades = !config.ThemeShowcase &&
+		((getHideUpgrades != nil && getHideUpgrades()) || (config.Edition == "Community" && !showCloudPromotion.Load()))
 
-	config.ShowCloudPromotion = !hideCloudPromotion.Load() && (config.Edition == "Community" || config.ThemeShowcase)
+	config.CustomHtmlAllowedTags = GetCustomHtmlAllowedTags()
+
+	config.ShowCloudPromotion = config.ThemeShowcase || (showCloudPromotion.Load() && config.Edition == "Community")
 
 	return config
 }

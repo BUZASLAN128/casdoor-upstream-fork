@@ -124,6 +124,7 @@ func runServer() {
 	web.InsertFilter("*", web.BeforeStatic, routers.RequestBodyFilter)
 	web.InsertFilter("*", web.BeforeStatic, routers.ContentTypeFilter)
 	web.InsertFilter("*", web.BeforeStatic, routers.UploadedFileFilter)
+	web.InsertFilter("*", web.BeforeRouter, routers.SessionCookieFilter)
 	web.InsertFilter("*", web.BeforeRouter, routers.StaticFilter)
 	web.InsertFilter("*", web.BeforeRouter, routers.AutoSigninFilter)
 	web.InsertFilter("*", web.BeforeRouter, routers.CorsFilter)
@@ -170,6 +171,7 @@ func runServer() {
 
 	// Start webhook delivery worker
 	object.StartWebhookDeliveryWorker()
+	object.StartProvisioningWorker()
 
 	if len(object.SiteMap) != 0 {
 		service.Start()

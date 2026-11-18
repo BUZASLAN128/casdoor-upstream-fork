@@ -39,7 +39,7 @@ export default function IntegrationEditPage() {
           }
         });
       }
-      if (res.data) {
+      if (res.data && res.data.source !== "file") {
         IntegrationBackend.getMarketplaceIndex(organizationName).then((indexRes: any) => {
           const item = indexRes.data?.integrations?.find((i: any) => i.id === res.data.integrationId);
           setLatest(item?.latest ?? "");
@@ -80,7 +80,12 @@ export default function IntegrationEditPage() {
     {label: i18next.t("general:Name"), children: integration.name},
     {
       label: i18next.t("integration:Integration"),
-      children: (
+      children: integration.source === "file" ? (
+        <span className="flex items-center gap-2">
+          {integration.integrationId}
+          <Badge variant="secondary">{i18next.t("integration:Installed from file")}</Badge>
+        </span>
+      ) : (
         <a className="inline-flex items-center gap-1 underline-offset-4 hover:underline" href={`${getMarketplaceSiteUrl()}/integrations/${integration.integrationId}/`} target="_blank" rel="noreferrer">
           {integration.integrationId}
           <ExternalLink className="size-3.5" />
@@ -102,6 +107,11 @@ export default function IntegrationEditPage() {
       children: <Link className="underline-offset-4 hover:underline" to={`/applications/${integration.owner}/${integration.application}`}>{integration.application}</Link>,
     },
     {
+      label: i18next.t("server:Agent"),
+      hidden: !integration.application || !files["application.json"]?.agent,
+      children: <Link className="underline-offset-4 hover:underline" to={`/agents/${integration.owner}/${integration.name}`}>{integration.name}</Link>,
+    },
+    {
       label: i18next.t("general:Provider"),
       hidden: !integration.provider,
       children: <Link className="underline-offset-4 hover:underline" to={`/providers/${integration.owner}/${integration.provider}`}>{integration.provider}</Link>,
@@ -112,6 +122,21 @@ export default function IntegrationEditPage() {
       children: (
         <div className="space-y-0.5">
           {(bundle?.manifest?.permissions?.hosts ?? []).map((host: string) => <div key={host}><code className="font-mono text-xs">{host}</code></div>)}
+        </div>
+      ),
+    },
+    {
+      label: i18next.t("integration:Downloads"),
+      hidden: !bundle?.manifest?.downloads?.length || integration.source === "file",
+      children: (
+        <div className="flex flex-wrap gap-2">
+          {(bundle?.manifest?.downloads ?? []).map((path: string) => (
+            <Button key={path} variant="outline" size="sm" asChild>
+              <a href={`${Setting.ServerUrl}/api/download-marketplace-file?owner=${encodeURIComponent(integration.owner)}&integrationId=${encodeURIComponent(integration.integrationId)}&path=${encodeURIComponent(path)}`}>
+                {path.split("/").pop()}
+              </a>
+            </Button>
+          ))}
         </div>
       ),
     },

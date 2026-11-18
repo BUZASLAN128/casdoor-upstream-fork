@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/casdoor/casdoor/edition"
 	"github.com/casdoor/casdoor/mcp"
 	"github.com/casdoor/casdoor/util"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,7 +27,8 @@ import (
 
 type Tool struct {
 	mcpsdk.Tool
-	IsAllowed bool `json:"isAllowed"`
+	IsAllowed       bool `json:"isAllowed"`
+	RequireApproval bool `json:"requireApproval"`
 }
 
 type Server struct {
@@ -41,6 +43,34 @@ type Server struct {
 	TokenHeader string  `xorm:"varchar(100)" json:"tokenHeader"`
 	Application string  `xorm:"varchar(100)" json:"application"`
 	Tools       []*Tool `xorm:"mediumtext" json:"tools"`
+
+	// IdentityHeader is the request header that carries the caller's identity token to the upstream MCP server
+	IdentityHeader string `xorm:"varchar(100)" json:"identityHeader"`
+	// EnableToolPermissions makes every tool call need an "MCP tool" permission of the user and of the agent
+	EnableToolPermissions bool `json:"enableToolPermissions"`
+}
+
+func (server *Server) GetTool(name string) *Tool {
+	for _, tool := range server.Tools {
+		if tool.Name == name {
+			return tool
+		}
+	}
+	return nil
+}
+
+func checkServer(server *Server) error {
+	if server.IdentityHeader != "" && server.Application == "" {
+		return fmt.Errorf("the identity token is signed with the certificate of the application, please select an application for the MCP server: %s", server.GetId())
+	}
+	for _, tool := range server.Tools {
+		if tool.RequireApproval {
+			if err := edition.Require(edition.Enterprise, edition.FeatureMcpApproval); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // GetMaskedServer clears the token used to access the upstream MCP server, so that it is
@@ -106,6 +136,10 @@ func UpdateServer(id string, server *Server) (bool, error) {
 	server.UpdatedTime = util.GetCurrentTime()
 
 	_ = syncServerTools(server)
+
+	if err = checkServer(server); err != nil {
+		return false, err
+	}
 
 	_, err = ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(server)
 	if err != nil {
@@ -173,13 +207,16 @@ func syncServerTools(server *Server) error {
 		})
 
 		isAllowed := true
+		requireApproval := false
 		if oldToolIndex != -1 {
 			isAllowed = oldTools[oldToolIndex].IsAllowed
+			requireApproval = oldTools[oldToolIndex].RequireApproval
 		}
 
 		newTool := Tool{
-			Tool:      *tool,
-			IsAllowed: isAllowed,
+			Tool:            *tool,
+			IsAllowed:       isAllowed,
+			RequireApproval: requireApproval,
 		}
 		newTools = append(newTools, &newTool)
 	}
@@ -189,6 +226,10 @@ func syncServerTools(server *Server) error {
 }
 
 func AddServer(server *Server) (bool, error) {
+	if err := checkServer(server); err != nil {
+		return false, err
+	}
+
 	affected, err := ormer.Engine.Insert(server)
 	if err != nil {
 		return false, err
@@ -243,4 +284,47 @@ func IsServerAllowed(user *User, owner string, name string) (bool, error) {
 	}
 
 	return CheckLoginPermission(user.GetId(), application)
+}
+
+// UserMcpServer is an MCP server as the agents of a user see it: only its gateway address and its allowed tools
+type UserMcpServer struct {
+	Owner                 string         `json:"owner"`
+	Name                  string         `json:"name"`
+	DisplayName           string         `json:"displayName"`
+	Url                   string         `json:"url"`
+	EnableToolPermissions bool           `json:"enableToolPermissions"`
+	Tools                 []*UserMcpTool `json:"tools"`
+}
+
+type UserMcpTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// GetUserMcpServers lists the MCP servers of the user's organization with their gateway addresses, so an agent signed
+// in as the user can connect to them, the upstream addresses and tokens stay hidden
+func GetUserMcpServers(user *User, host string) ([]*UserMcpServer, error) {
+	servers, err := GetServers(user.Owner)
+	if err != nil {
+		return nil, err
+	}
+
+	res := []*UserMcpServer{}
+	for _, server := range servers {
+		tools := []*UserMcpTool{}
+		for _, tool := range server.Tools {
+			if tool.IsAllowed {
+				tools = append(tools, &UserMcpTool{Name: tool.Name, Description: tool.Description})
+			}
+		}
+		res = append(res, &UserMcpServer{
+			Owner:                 server.Owner,
+			Name:                  server.Name,
+			DisplayName:           server.DisplayName,
+			Url:                   GetServerProxyUrl(host, server.Owner, server.Name),
+			EnableToolPermissions: server.EnableToolPermissions,
+			Tools:                 tools,
+		})
+	}
+	return res, nil
 }

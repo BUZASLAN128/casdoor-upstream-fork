@@ -2,6 +2,22 @@ package object
 
 import "testing"
 
+func TestCerberusSecurityFederatedSignupRequiresApplicationPermission(t *testing.T) {
+	applications := []Application{
+		{Name: "signup-disabled", Organization: "tenant-a"},
+		{Name: "built-in", Organization: "built-in", EnableSignUp: true},
+		{Name: "invitation-required", Organization: "tenant-a", EnableSignUp: true, SignupItems: []*SignupItem{{Name: "Invitation code", Required: true}}},
+	}
+	for _, application := range applications {
+		t.Run(application.Name, func(t *testing.T) {
+			user, tokenError, err := addFederatedUser(&application, "test-user", nil, "127.0.0.1", "en")
+			if user != nil || tokenError == nil || tokenError.Error != InvalidGrant || err != nil {
+				t.Fatalf("federated signup returned user=%v, token error=%v, error=%v, want invalid_grant", user != nil, tokenError, err)
+			}
+		})
+	}
+}
+
 func TestApplicationIsSignupAllowedForBindsOrganization(t *testing.T) {
 	tests := []struct {
 		name         string

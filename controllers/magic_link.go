@@ -80,7 +80,7 @@ func (c *ApiController) checkMagicLinkSignin(authForm *form.AuthForm) (*object.U
 	}
 
 	if user.IsDeleted || user.IsForbidden {
-		return nil, errors.New(c.T("check:The user is forbidden to sign in, please contact the administrator"))
+		return nil, errors.New(object.GetUserForbiddenMessage(user, c.GetAcceptLanguage()))
 	}
 
 	if !user.EmailVerified {
@@ -171,6 +171,7 @@ func (c *ApiController) addMagicLinkUser(application *object.Application, magicL
 	if application.DefaultTag != "" {
 		user.Tag = application.DefaultTag
 	}
+	application.ApplySignupApproval(user)
 
 	affected, err := object.AddUser(user, c.GetAcceptLanguage())
 	if err != nil {

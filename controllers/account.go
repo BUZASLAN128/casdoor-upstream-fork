@@ -326,6 +326,8 @@ func (c *ApiController) Signup() {
 		return
 	}
 
+	application.ApplySignupApproval(user)
+
 	affected, err := object.AddUser(user, c.GetAcceptLanguage())
 	if err != nil {
 		c.ResponseError(err.Error())
@@ -351,11 +353,15 @@ func (c *ApiController) Signup() {
 			return
 		}
 	}
-	if user.Type == "normal-user" {
-		c.renewSessionIdForUser(user.GetId())
-		c.SetSessionUsername(user.GetId())
-	} else if user.Type == "paid-user" {
-		c.SetSession("paidUsername", user.GetId())
+
+	// no session or authorization code until an administrator approves the user
+	if !user.PendingApproval {
+		if user.Type == "normal-user" {
+			c.renewSessionIdForUser(user.GetId())
+			c.SetSessionUsername(user.GetId())
+		} else if user.Type == "paid-user" {
+			c.SetSession("paidUsername", user.GetId())
+		}
 	}
 
 	if authForm.Email != "" {
@@ -379,6 +385,11 @@ func (c *ApiController) Signup() {
 
 	userId := user.GetId()
 	util.LogInfo(c.Ctx, "API: [%s] is signed up as new user", userId)
+
+	if user.PendingApproval {
+		c.ResponseOk(userId, "pending-approval")
+		return
+	}
 
 	// Check if this is an OAuth flow and automatically generate code
 	redirectUri := c.Ctx.Input.Query("redirectUri")

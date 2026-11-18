@@ -77,8 +77,6 @@ export const EditionFeatures: EditionFeature[] = [
     stop: {object: "cert", target: "[data-tour='rotate-key']"}},
   {id: "auto-rotation", edition: "Commercial", category: "edition:Keys and access control", name: "edition:Automatic rotation and expiry alerts", description: "edition:Automatic rotation and expiry alerts - Description",
     stop: org("security", "application:Security", "organization:Rotate signing keys automatically")},
-  {id: "rbac", edition: "Commercial", category: "edition:Keys and access control", name: "edition:Role-based access control", description: "edition:Role-based access control - Description",
-    stop: {object: "permission", label: "role:Sub roles"}},
   {id: "abac", edition: "Commercial", category: "edition:Keys and access control", name: "edition:Attribute-based access control", description: "edition:Attribute-based access control - Description",
     stop: {object: "model", label: "model:Model text"}},
   {id: "syncers", edition: "Commercial", category: "edition:Keys and access control", name: "edition:More syncers", description: "edition:More syncers - Description",
@@ -88,6 +86,12 @@ export const EditionFeatures: EditionFeature[] = [
     stop: {object: "server", label: "server:Token header"}},
   {id: "mcp-records", edition: "Commercial", category: "edition:AI agents", name: "edition:MCP tool call records", description: "edition:MCP tool call records - Description",
     stop: org("security", "application:Security", "organization:Record MCP tool calls")},
+  {id: "mcp-tool-permissions", edition: "Commercial", category: "edition:AI agents", name: "edition:Tool permissions for agents", description: "edition:Tool permissions for agents - Description",
+    stop: {object: "server", label: "server:Tool permissions"}},
+  {id: "mcp-identity", edition: "Commercial", category: "edition:AI agents", name: "edition:Identity and trace for MCP servers", description: "edition:Identity and trace for MCP servers - Description",
+    stop: {object: "server", label: "server:Identity header"}},
+  {id: "scim-provisioning", edition: "Commercial", category: "edition:Keys and access control", name: "edition:SCIM provisioning", description: "edition:SCIM provisioning - Description",
+    stop: app("provisioning", "application:Provisioning", "application:Enable provisioning")},
   {id: "id-jag", edition: "Commercial", category: "edition:AI agents", name: "edition:Identity assertion grants", description: "edition:Identity assertion grants - Description",
     stop: org("advanced", "provider:Advanced", "organization:Trusted ID-JAG issuers")},
 
@@ -122,6 +126,11 @@ export const EditionFeatures: EditionFeature[] = [
     stop: org("enterprise", "general:Compliance", "organization:Record consents")},
   {id: "siem", edition: "Enterprise", category: "edition:Administration and audit", name: "edition:CEF and LEEF log forwarding", description: "edition:CEF and LEEF log forwarding - Description",
     stop: {path: "/providers"}},
+
+  {id: "db-provisioning", edition: "Enterprise", category: "edition:Enterprise connections", name: "edition:Provisioning to legacy databases", description: "edition:Provisioning to legacy databases - Description",
+    stop: app("provisioning", "application:Provisioning", "application:Enable provisioning")},
+  {id: "mcp-approval", edition: "Enterprise", category: "edition:AI agents", name: "edition:Approval of tool calls", description: "edition:Approval of tool calls - Description",
+    stop: {object: "server", label: "server:Needs approval"}},
 
   {id: "sod", edition: "Enterprise", category: "edition:Governance and compliance", name: "edition:Separation-of-duty rules", description: "edition:Separation-of-duty rules - Description",
     stop: org("enterprise", "general:Compliance", undefined, "[data-tour='sod-rules']")},
