@@ -31,6 +31,10 @@ func TestCerberusSecurityTokenExchangeRejectsSenderConstrainedSubjects(t *testin
 			if tokenError == nil || tokenError.Error != InvalidGrant {
 				t.Fatalf("sender-constrained subject error = %#v, want invalid_grant", tokenError)
 			}
+			actorError := validateUnboundTokenExchangeAccessToken(tt.record, "actor")
+			if actorError == nil || actorError.Error != InvalidGrant {
+				t.Fatalf("sender-constrained actor error = %#v, want invalid_grant", actorError)
+			}
 		})
 	}
 }
@@ -39,6 +43,9 @@ func TestCerberusSecurityTokenExchangePreservesBearerAndIdTokenFlows(t *testing.
 	bearerRecord := &Token{AccessToken: "bearer-subject", TokenType: "Bearer"}
 	if tokenError := validateTokenExchangeSubjectBinding(bearerRecord, bearerRecord.AccessToken); tokenError != nil {
 		t.Fatalf("bearer subject token was rejected: %#v", tokenError)
+	}
+	if tokenError := validateUnboundTokenExchangeAccessToken(bearerRecord, "actor"); tokenError != nil {
+		t.Fatalf("bearer actor token was rejected: %#v", tokenError)
 	}
 
 	dpopRecord := &Token{AccessToken: "dpop-access", IdToken: "subject-id-token", TokenType: "DPoP", DPoPJkt: "bound-key"}

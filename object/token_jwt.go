@@ -40,6 +40,15 @@ type OidcIdTokenClaims struct {
 	Sid string `json:"sid,omitempty"`
 }
 
+// ActClaim is the RFC 8693 "act" claim: the party (such as an AI agent) acting for the token's subject, with the
+// party it acts for in turn nested in its own "act"
+type ActClaim struct {
+	Sub      string    `json:"sub"`
+	ClientId string    `json:"client_id,omitempty"`
+	Agent    string    `json:"agent,omitempty"`
+	Act      *ActClaim `json:"act,omitempty"`
+}
+
 type Claims struct {
 	*User
 	TokenType string `json:"tokenType,omitempty"`
@@ -47,8 +56,11 @@ type Claims struct {
 	Tag       string `json:"tag"`
 	Scope     string `json:"scope,omitempty"`
 	// the `azp` (Authorized Party) claim. Optional. See https://openid.net/specs/openid-connect-core-1_0.html#IDToken
-	Azp      string `json:"azp,omitempty"`
-	Provider string `json:"provider,omitempty"`
+	Azp      string    `json:"azp,omitempty"`
+	Provider string    `json:"provider,omitempty"`
+	Act      *ActClaim `json:"act,omitempty"`
+	// the RFC 9449 "cnf" claim of an access token bound to a DPoP key
+	Cnf *DPoPConfirmation `json:"cnf,omitempty"`
 
 	SigninMethod string `json:"signinMethod,omitempty"`
 	OidcIdTokenClaims
@@ -88,9 +100,6 @@ type UserWithoutThirdIdp struct {
 
 	Id                string   `xorm:"varchar(100) index" json:"id"`
 	Type              string   `xorm:"varchar(100)" json:"type"`
-	Password          string   `xorm:"varchar(150)" json:"password"`
-	PasswordSalt      string   `xorm:"varchar(100)" json:"passwordSalt"`
-	PasswordType      string   `xorm:"varchar(100)" json:"passwordType"`
 	DisplayName       string   `xorm:"varchar(100)" json:"displayName"`
 	FirstName         string   `xorm:"varchar(100)" json:"firstName"`
 	LastName          string   `xorm:"varchar(100)" json:"lastName"`
@@ -124,8 +133,6 @@ type UserWithoutThirdIdp struct {
 	IsForbidden       bool     `json:"isForbidden"`
 	IsDeleted         bool     `json:"isDeleted"`
 	SignupApplication string   `xorm:"varchar(100)" json:"signupApplication"`
-	Hash              string   `xorm:"varchar(100)" json:"hash"`
-	PreHash           string   `xorm:"varchar(100)" json:"preHash"`
 	RegisterType      string   `xorm:"varchar(100)" json:"registerType"`
 	RegisterSource    string   `xorm:"varchar(100)" json:"registerSource"`
 
@@ -147,11 +154,9 @@ type UserWithoutThirdIdp struct {
 	LastSigninIp   string `xorm:"varchar(100)" json:"lastSigninIp"`
 
 	// WebauthnCredentials []webauthn.Credential `xorm:"webauthnCredentials blob" json:"webauthnCredentials"`
-	PreferredMfaType string   `xorm:"varchar(100)" json:"preferredMfaType"`
-	RecoveryCodes    []string `xorm:"varchar(1000)" json:"recoveryCodes"`
-	TotpSecret       string   `xorm:"varchar(100)" json:"totpSecret"`
-	MfaPhoneEnabled  bool     `json:"mfaPhoneEnabled"`
-	MfaEmailEnabled  bool     `json:"mfaEmailEnabled"`
+	PreferredMfaType string `xorm:"varchar(100)" json:"preferredMfaType"`
+	MfaPhoneEnabled  bool   `json:"mfaPhoneEnabled"`
+	MfaEmailEnabled  bool   `json:"mfaEmailEnabled"`
 	// MultiFactorAuths    []*MfaProps           `xorm:"-" json:"multiFactorAuths,omitempty"`
 
 	Ldap       string            `xorm:"ldap varchar(100)" json:"ldap"`
@@ -163,17 +168,17 @@ type UserWithoutThirdIdp struct {
 
 	LastSigninWrongTime string `xorm:"varchar(100)" json:"lastSigninWrongTime"`
 	SigninWrongTimes    int    `json:"signinWrongTimes"`
-
-	ManagedAccounts []ManagedAccount `xorm:"managedAccounts blob" json:"managedAccounts"`
 }
 
 type ClaimsShort struct {
 	*UserShort
-	TokenType string `json:"tokenType,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	Azp       string `json:"azp,omitempty"`
-	Provider  string `json:"provider,omitempty"`
+	TokenType string            `json:"tokenType,omitempty"`
+	Nonce     string            `json:"nonce,omitempty"`
+	Scope     string            `json:"scope,omitempty"`
+	Azp       string            `json:"azp,omitempty"`
+	Provider  string            `json:"provider,omitempty"`
+	Act       *ActClaim         `json:"act,omitempty"`
+	Cnf       *DPoPConfirmation `json:"cnf,omitempty"`
 
 	SigninMethod string `json:"signinMethod,omitempty"`
 	OidcIdTokenClaims
@@ -191,12 +196,14 @@ type OIDCAddress struct {
 
 type ClaimsWithoutThirdIdp struct {
 	*UserWithoutThirdIdp
-	TokenType string `json:"tokenType,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Tag       string `json:"tag"`
-	Scope     string `json:"scope,omitempty"`
-	Azp       string `json:"azp,omitempty"`
-	Provider  string `json:"provider,omitempty"`
+	TokenType string            `json:"tokenType,omitempty"`
+	Nonce     string            `json:"nonce,omitempty"`
+	Tag       string            `json:"tag"`
+	Scope     string            `json:"scope,omitempty"`
+	Azp       string            `json:"azp,omitempty"`
+	Provider  string            `json:"provider,omitempty"`
+	Act       *ActClaim         `json:"act,omitempty"`
+	Cnf       *DPoPConfirmation `json:"cnf,omitempty"`
 
 	SigninMethod string `json:"signinMethod,omitempty"`
 	OidcIdTokenClaims
@@ -252,9 +259,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 
 		Id:                user.Id,
 		Type:              user.Type,
-		Password:          user.Password,
-		PasswordSalt:      user.PasswordSalt,
-		PasswordType:      user.PasswordType,
 		DisplayName:       user.DisplayName,
 		FirstName:         user.FirstName,
 		LastName:          user.LastName,
@@ -288,8 +292,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 		IsForbidden:       user.IsForbidden,
 		IsDeleted:         user.IsDeleted,
 		SignupApplication: user.SignupApplication,
-		Hash:              user.Hash,
-		PreHash:           user.PreHash,
 		RegisterType:      user.RegisterType,
 		RegisterSource:    user.RegisterSource,
 
@@ -311,8 +313,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 		LastSigninIp:   user.LastSigninIp,
 
 		PreferredMfaType: user.PreferredMfaType,
-		RecoveryCodes:    user.RecoveryCodes,
-		TotpSecret:       user.TotpSecret,
 		MfaPhoneEnabled:  user.MfaPhoneEnabled,
 		MfaEmailEnabled:  user.MfaEmailEnabled,
 
@@ -325,8 +325,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 
 		LastSigninWrongTime: user.LastSigninWrongTime,
 		SigninWrongTimes:    user.SigninWrongTimes,
-
-		ManagedAccounts: user.ManagedAccounts,
 	}
 
 	return res
@@ -342,6 +340,8 @@ func getShortClaims(claims Claims) ClaimsShort {
 		Azp:               claims.Azp,
 		SigninMethod:      claims.SigninMethod,
 		Provider:          claims.Provider,
+		Act:               claims.Act,
+		Cnf:               claims.Cnf,
 		OidcIdTokenClaims: claims.OidcIdTokenClaims,
 	}
 	return res
@@ -358,6 +358,8 @@ func getClaimsWithoutThirdIdp(claims Claims) ClaimsWithoutThirdIdp {
 		Azp:                 claims.Azp,
 		SigninMethod:        claims.SigninMethod,
 		Provider:            claims.Provider,
+		Act:                 claims.Act,
+		Cnf:                 claims.Cnf,
 		OidcIdTokenClaims:   claims.OidcIdTokenClaims,
 	}
 	return res
@@ -449,6 +451,12 @@ func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtI
 	// Always include azp if present (authorized party)
 	if claims.Azp != "" {
 		res["azp"] = claims.Azp
+	}
+	if claims.Act != nil {
+		res["act"] = claims.Act
+	}
+	if claims.Cnf != nil {
+		res["cnf"] = claims.Cnf
 	}
 
 	// Always include nonce and scope as they are built-in OAuth/OIDC fields (even if empty)
@@ -617,6 +625,10 @@ type jwtTokenOptions struct {
 	RefreshScope string
 	// SessionId is the Beego session id the tokens are minted under, its hash is the "sid" of the ID token
 	SessionId string
+	// Actor is the RFC 8693 "act" claim of the access and refresh tokens
+	Actor *ActClaim
+	// DPoPJkt is the thumbprint of the DPoP key the access token is bound to, its RFC 9449 "cnf" claim
+	DPoPJkt string
 }
 
 // getOidcHash returns the left-most half of the hash of value, base64url encoded, using the hash
@@ -707,12 +719,19 @@ func generateJwtTokenWithOptions(application *Application, user *User, provider 
 		claims.Audience = []string{resource}
 	}
 
+	// RFC 8693: only the access token and the refresh token say who acts for the user, the ID token is about the user
+	claims.Act = options.Actor
+
 	// RFC 6749 section 6: the refresh token keeps the scope of the grant
 	refreshClaims := claims
 	refreshClaims.TokenType = "refresh-token"
 	refreshClaims.ExpiresAt = jwt.NewNumericDate(refreshExpireTime)
 	if options.RefreshScope != "" {
 		refreshClaims.Scope = options.RefreshScope
+	}
+
+	if options.DPoPJkt != "" {
+		claims.Cnf = &DPoPConfirmation{JKT: options.DPoPJkt}
 	}
 
 	var token *jwt.Token
@@ -724,7 +743,8 @@ func generateJwtTokenWithOptions(application *Application, user *User, provider 
 		application.TokenFormat = "JWT"
 	}
 
-	jwtMethod := getJwtSigningMethod(application)
+	signingApplication := getSigningApplication(application, user.Owner)
+	jwtMethod := getJwtSigningMethod(signingApplication)
 
 	// the JWT token length in "JWT-Empty" mode will be very short, as User object only has two properties: owner and name
 	if application.TokenFormat == "JWT" {
@@ -749,16 +769,16 @@ func generateJwtTokenWithOptions(application *Application, user *User, provider 
 		return "", "", "", "", fmt.Errorf("unknown application TokenFormat: %s", application.TokenFormat)
 	}
 
-	cert, err := getCertByApplication(application)
+	cert, err := getCertByApplication(signingApplication)
 	if err != nil {
 		return "", "", "", "", err
 	}
 
 	if cert == nil {
-		if application.Cert == "" {
+		if signingApplication.Cert == "" {
 			return "", "", "", "", fmt.Errorf("The cert field of the application \"%s\" should not be empty", application.GetId())
 		} else {
-			return "", "", "", "", fmt.Errorf("The cert \"%s\" does not exist", application.Cert)
+			return "", "", "", "", fmt.Errorf("The cert \"%s\" does not exist", signingApplication.Cert)
 		}
 	}
 
@@ -859,7 +879,7 @@ func ParseJwtToken(token string, cert *Cert) (*Claims, error) {
 }
 
 func ParseJwtTokenByApplication(token string, application *Application) (*Claims, error) {
-	cert, err := getCertByApplication(application)
+	cert, err := getCertByApplicationOfToken(application, token)
 	if err != nil {
 		return nil, err
 	}

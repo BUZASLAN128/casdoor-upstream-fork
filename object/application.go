@@ -119,6 +119,7 @@ type Application struct {
 	EnablePassword               bool            `json:"enablePassword"`
 	EnableSignUp                 bool            `json:"enableSignUp"`
 	DisableSelfSignup            bool            `json:"disableSelfSignup"`
+	SignupApproval               bool            `json:"signupApproval"`
 	EnableGuestSignin            bool            `json:"enableGuestSignin"`
 	DisableSignin                bool            `json:"disableSignin"`
 	EnableSigninSession          bool            `json:"enableSigninSession"`
@@ -205,9 +206,12 @@ type Application struct {
 	// FormFill signs users into legacy systems without SSO by filling their sign-in forms with the managed accounts
 	FormFill *FormFill `xorm:"json" json:"formFill"`
 
+	Provisioning *ProvisioningConfig `xorm:"json" json:"provisioning"`
+
 	CertObj *Cert `xorm:"-"`
 
 	RegistrationAccessToken string `xorm:"varchar(100)" json:"registrationAccessToken"`
+	TokenEndpointAuthMethod string `xorm:"varchar(100)" json:"tokenEndpointAuthMethod"`
 }
 
 func (application *Application) HasSigninMethod(name string) bool {
@@ -556,6 +560,7 @@ func UpdateApplication(id string, application *Application, isGlobalAdmin bool, 
 		return false, err
 	}
 
+	ClearProvisioningApplicationCache()
 	return affected != 0, nil
 }
 

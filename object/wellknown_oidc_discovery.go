@@ -168,8 +168,9 @@ func GetOidcIssuerByApplication(host string, application *Application) (string, 
 func getOrganizationEndpoints(registrationEndpoint string, authorizationEndpoint string, organizationName string) (string, string) {
 	registrationEndpoint = fmt.Sprintf("%s?organization=%s", registrationEndpoint, url.QueryEscape(organizationName))
 	// Tells URL client_ids which organization to be added to, as registrationEndpoint does for DCR
+	// The organization goes in the path, because many clients append their parameters to the authorization endpoint with "?"
 	if organizationName != cimdOrganization && IsClientIdMetadataDocumentSupported(organizationName) {
-		authorizationEndpoint = fmt.Sprintf("%s?organization=%s", authorizationEndpoint, url.QueryEscape(organizationName))
+		authorizationEndpoint = strings.Replace(authorizationEndpoint, "/login/oauth/authorize", fmt.Sprintf("/orgs/%s/login/oauth/authorize", url.PathEscape(organizationName)), 1)
 	}
 	return registrationEndpoint, authorizationEndpoint
 }
@@ -303,8 +304,49 @@ func getJsonWebKeySetCerts(applicationName string) ([]*Cert, error) {
 		if err != nil {
 			return nil, err
 		}
+		certs, err = getSigningCerts(certs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return certs, nil
+}
+
+// getSigningCerts leaves out the certs that can't sign the tokens of Casdoor: a certificate without its private key, and
+// the client certificate of private_key_jwt, whose key is the client's. A token signed by such a key would otherwise
+// pass a resource server that trusts the JWKS.
+func getSigningCerts(certs []*Cert) ([]*Cert, error) {
+	applications := []*Application{}
+	err := ormer.Engine.Cols("cert", "client_cert").Where("client_cert <> ?", "").Find(&applications)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCerts := map[string]bool{}
+	for _, application := range applications {
+		clientCerts[application.ClientCert] = true
+	}
+
+	signingApplications := []*Application{}
+	err = ormer.Engine.Cols("cert").Where("cert <> ?", "").Find(&signingApplications)
+	if err != nil {
+		return nil, err
+	}
+	for _, application := range signingApplications {
+		delete(clientCerts, application.Cert)
+	}
+
+	res := []*Cert{}
+	for _, cert := range certs {
+		if clientCerts[cert.Name] {
+			continue
+		}
+		if cert.Type == "x509" && cert.PrivateKey == "" && !cert.IsHsmKey() {
+			continue
+		}
+		res = append(res, cert)
+	}
+	return res, nil
 }
 
 func GetJsonWebKeySet(applicationName string) (jose.JSONWebKeySet, error) {

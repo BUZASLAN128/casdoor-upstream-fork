@@ -94,6 +94,7 @@ p, *, *, POST, /api/send-verification-code, *, *
 p, *, *, POST, /api/mfa/push/send, *, *
 p, *, *, GET, /api/get-user-personal-info, *, *
 p, *, *, GET, /api/get-mcp-records, *, *
+p, *, *, GET, /api/get-my-mcp-servers, *, *
 p, *, *, GET, /api/get-form-fill-sites, *, *
 p, *, *, GET, /api/get-form-fill-account, *, *
 p, *, *, POST, /api/save-form-fill-account, *, *
@@ -130,6 +131,7 @@ p, *, *, GET, /.well-known/:application/openid-configuration, *, *
 p, *, *, GET, /.well-known/:application/oauth-authorization-server, *, *
 p, *, *, GET, /.well-known/:application/oauth-protected-resource, *, *
 p, *, *, GET, /.well-known/oauth-protected-resource/api/server/:owner/:name, *, *
+p, *, *, GET, /.well-known/oauth-protected-resource/api/mcp/orgs/:organization, *, *
 p, *, *, GET, /.well-known/:application/webfinger, *, *
 p, *, *, GET, /orgs/:organization/.well-known/openid-configuration, *, *
 p, *, *, GET, /orgs/:organization/.well-known/oauth-authorization-server, *, *

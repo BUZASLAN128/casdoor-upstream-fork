@@ -24,16 +24,18 @@ import (
 
 type ClaimsStandard struct {
 	*UserStandard
-	EmailVerified       bool         `json:"email_verified,omitempty"`
-	PhoneNumber         string       `json:"phone_number,omitempty"`
-	PhoneNumberVerified bool         `json:"phone_number_verified,omitempty"`
-	Gender              string       `json:"gender,omitempty"`
-	TokenType           string       `json:"tokenType,omitempty"`
-	Nonce               string       `json:"nonce,omitempty"`
-	Scope               string       `json:"scope,omitempty"`
-	Address             *OIDCAddress `json:"address,omitempty"`
-	Azp                 string       `json:"azp,omitempty"`
-	Provider            string       `json:"provider,omitempty"`
+	EmailVerified       bool              `json:"email_verified,omitempty"`
+	PhoneNumber         string            `json:"phone_number,omitempty"`
+	PhoneNumberVerified bool              `json:"phone_number_verified,omitempty"`
+	Gender              string            `json:"gender,omitempty"`
+	TokenType           string            `json:"tokenType,omitempty"`
+	Nonce               string            `json:"nonce,omitempty"`
+	Scope               string            `json:"scope,omitempty"`
+	Address             *OIDCAddress      `json:"address,omitempty"`
+	Azp                 string            `json:"azp,omitempty"`
+	Provider            string            `json:"provider,omitempty"`
+	Act                 *ActClaim         `json:"act,omitempty"`
+	Cnf                 *DPoPConfirmation `json:"cnf,omitempty"`
 
 	OidcIdTokenClaims
 	jwt.RegisteredClaims
@@ -68,6 +70,8 @@ func getStandardClaims(claims Claims) ClaimsStandard {
 		RegisteredClaims:  claims.RegisteredClaims,
 		Azp:               claims.Azp,
 		Provider:          claims.Provider,
+		Act:               claims.Act,
+		Cnf:               claims.Cnf,
 		OidcIdTokenClaims: claims.OidcIdTokenClaims,
 	}
 
@@ -134,7 +138,7 @@ func ParseStandardJwtToken(token string, cert *Cert) (*ClaimsStandard, error) {
 }
 
 func ParseStandardJwtTokenByApplication(token string, application *Application) (*ClaimsStandard, error) {
-	cert, err := getCertByApplication(application)
+	cert, err := getCertByApplicationOfToken(application, token)
 	if err != nil {
 		return nil, err
 	}

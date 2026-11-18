@@ -16,6 +16,7 @@ package object
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func GetOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, scope string, nonce string, username string, password string, countryCode string, host string, refreshToken string, tag string, avatar string, phoneCode string, phoneRequired bool, lang string, subjectToken string, subjectTokenType string, requestedTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, dpopProof string, clientIp string) (interface{}, error) {
+func GetOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, scope string, nonce string, username string, password string, countryCode string, host string, refreshToken string, tag string, avatar string, phoneCode string, phoneRequired bool, lang string, subjectToken string, subjectTokenType string, actorToken string, actorTokenType string, requestedTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, dpopProof string, clientIp string) (interface{}, error) {
 	var (
 		application *Application
 		err         error
@@ -81,6 +82,18 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 		}, nil
 	}
 
+	// RFC 9449: the DPoP proof is checked before the grant, so that a bad proof doesn't use up the authorization code
+	dpopJkt := ""
+	if dpopProof != "" && grantType != "refresh_token" {
+		dpopJkt, err = ValidateDPoPProof(dpopProof, "POST", GetDPoPHtu(host, "/api/login/oauth/access_token"), "")
+		if err != nil {
+			return &TokenError{
+				Error:            "invalid_dpop_proof",
+				ErrorDescription: err.Error(),
+			}, nil
+		}
+	}
+
 	var token *Token
 	var tokenError *TokenError
 	switch grantType {
@@ -89,7 +102,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 	case "password": // Resource Owner Password Credentials Grant
 		token, tokenError, err = GetPasswordToken(application, username, password, scope, host, clientIp, lang)
 	case "client_credentials": // Client Credentials Grant
-		token, tokenError, err = GetClientCredentialsToken(application, clientSecret, scope, host)
+		token, tokenError, err = GetClientCredentialsToken(application, clientSecret, scope, resource, host)
 	case VerificationCodeGrantType:
 		token, tokenError, err = GetVerificationCodeToken(application, username, countryCode, code, scope, host, clientIp, lang)
 	case MobileOneClickGrantType:
@@ -131,7 +144,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 			}
 			return idJag, nil
 		}
-		token, tokenError, err = GetTokenExchangeToken(application, clientSecret, subjectToken, subjectTokenType, audience, scope, host)
+		token, tokenError, err = GetTokenExchangeToken(application, clientSecret, subjectToken, subjectTokenType, actorToken, actorTokenType, audience, resource, scope, host, clientIp, lang)
 	case "refresh_token":
 		refreshToken2, err := RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, resource, host, dpopProof, "/api/login/oauth/access_token")
 		if err != nil {
@@ -148,19 +161,8 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 		return tokenError, nil
 	}
 
-	// Apply DPoP binding (RFC 9449) if a DPoP proof was supplied by the client.
-	if dpopProof != "" {
-		dpopHtu := GetDPoPHtu(host, "/api/login/oauth/access_token")
-		jkt, dpopErr := ValidateDPoPProof(dpopProof, "POST", dpopHtu, "")
-		if dpopErr != nil {
-			return &TokenError{
-				Error:            "invalid_dpop_proof",
-				ErrorDescription: dpopErr.Error(),
-			}, nil
-		}
-		token.TokenType = "DPoP"
-		token.DPoPJkt = jkt
-		if err = updateTokenDPoP(token); err != nil {
+	if dpopJkt != "" {
+		if err = bindTokenToDPoPKey(application, token, dpopJkt); err != nil {
 			return nil, err
 		}
 	}
@@ -408,17 +410,24 @@ func getUserGrantToken(application *Application, user *User, scope string, host 
 }
 
 // GetClientCredentialsToken handles the Client Credentials Grant flow.
-func GetClientCredentialsToken(application *Application, clientSecret string, scope string, host string) (*Token, *TokenError, error) {
+func GetClientCredentialsToken(application *Application, clientSecret string, scope string, resource string, host string) (*Token, *TokenError, error) {
 	if application.ClientSecret != clientSecret {
 		return nil, &TokenError{
 			Error:            InvalidClient,
 			ErrorDescription: "client_secret is invalid",
 		}, nil
 	}
-	return getApplicationToken(application, scope, host, "client_credentials")
+	if err := ValidateResourceURI(resource); err != nil {
+		return nil, &TokenError{
+			Error:            InvalidTarget,
+			ErrorDescription: err.Error(),
+		}, nil
+	}
+	return getApplicationToken(application, scope, resource, host, "client_credentials")
 }
 
-func getApplicationToken(application *Application, scope string, host string, grantType string) (*Token, *TokenError, error) {
+// getApplicationToken mints the token of the application itself, resource is the RFC 8707 resource indicator to bind it to
+func getApplicationToken(application *Application, scope string, resource string, host string, grantType string) (*Token, *TokenError, error) {
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -434,7 +443,7 @@ func getApplicationToken(application *Application, scope string, host string, gr
 		Type:  "application",
 	}
 
-	accessToken, _, _, tokenName, err := generateJwtToken(application, nullUser, "", "", "", scope, "", host)
+	accessToken, _, _, tokenName, err := generateJwtToken(application, nullUser, "", "", "", scope, resource, host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -454,6 +463,7 @@ func getApplicationToken(application *Application, scope string, host string, gr
 		Scope:        scope,
 		TokenType:    "Bearer",
 		GrantType:    grantType,
+		Resource:     resource,
 		CodeIsUsed:   true,
 	}
 	_, err = AddToken(token)
@@ -551,6 +561,13 @@ func getInactiveUserTokenError(user *User) *TokenError {
 		return nil
 	}
 
+	if user.PendingApproval && !user.IsDeleted {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "the user is waiting for the administrator's approval",
+		}
+	}
+
 	return &TokenError{
 		Error:            InvalidGrant,
 		ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
@@ -567,12 +584,12 @@ func GetJwtBearerToken(application *Application, assertion string, scope string,
 		}, nil
 	}
 	if credential != nil {
-		user, tokenError, err := getFederatedUser(application, credential, federatedClaims)
+		user, tokenError, err := getFederatedUser(application, credential, federatedClaims, clientIp, lang)
 		if err != nil || tokenError != nil {
 			return nil, tokenError, err
 		}
 		if user == nil {
-			return getApplicationToken(application, scope, host, "urn:ietf:params:oauth:grant-type:jwt-bearer")
+			return getApplicationToken(application, scope, "", host, "urn:ietf:params:oauth:grant-type:jwt-bearer")
 		}
 		if tokenError = checkGrantUserSignin(application, user, clientIp, lang); tokenError != nil {
 			return nil, tokenError, nil
@@ -791,6 +808,7 @@ func GetWechatMiniProgramToken(application *Application, code string, phoneCode 
 				UserPropertiesWechatUnionId: unionId,
 			},
 		}
+		application.ApplySignupApproval(user)
 		_, err = AddUser(user, lang)
 		if err != nil {
 			return nil, nil, err
@@ -837,14 +855,14 @@ func GetWechatMiniProgramToken(application *Application, code string, phoneCode 
 	return token, nil, nil
 }
 
-// GetTokenExchangeToken handles the Token Exchange Grant flow (RFC 8693).
-// Exchanges a subject token for a new token with different audience or scope.
 func hasSenderConstrainedConfirmation(claims jwt.MapClaims) bool {
 	_, ok := claims["cnf"]
 	return ok
 }
 
-func GetTokenExchangeToken(application *Application, clientSecret string, subjectToken string, subjectTokenType string, audience string, scope string, host string) (*Token, *TokenError, error) {
+// GetTokenExchangeToken handles the Token Exchange Grant flow (RFC 8693).
+// Exchanges a subject token for a new token with different audience or scope.
+func GetTokenExchangeToken(application *Application, clientSecret string, subjectToken string, subjectTokenType string, actorToken string, actorTokenType string, audience string, resource string, scope string, host string, clientIp string, lang string) (*Token, *TokenError, error) {
 	credential, federatedClaims, err := validateFederatedToken(application, subjectToken, host)
 	if err != nil {
 		return nil, &TokenError{
@@ -859,7 +877,7 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 				ErrorDescription: "exchange of sender-constrained subject tokens is not supported",
 			}, nil
 		}
-		return getFederatedTokenExchangeToken(application, credential, federatedClaims, audience, scope, host)
+		return getFederatedTokenExchangeToken(application, credential, federatedClaims, audience, scope, host, clientIp, lang)
 	}
 
 	if application.ClientSecret != clientSecret {
@@ -967,12 +985,31 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		}
 	}
 
+	// RFC 8707: a resource, such as an MCP server of the gateway, binds the new token to it
+	if resource != "" {
+		if resourceUrl, err := url.Parse(resource); err != nil || !resourceUrl.IsAbs() {
+			return nil, &TokenError{
+				Error:            InvalidTarget,
+				ErrorDescription: fmt.Sprintf("the resource is not an absolute URI: %s", resource),
+			}, nil
+		}
+		targetAudience = resource
+	}
+
+	actor, tokenError, err := getTokenExchangeActor(application, user, subjectToken, actorToken, actorTokenType)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tokenError != nil {
+		return nil, tokenError, nil
+	}
+
 	err = ExtendUserWithRolesAndPermissions(user)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	accessToken, refreshToken, idToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, targetAudience, host)
+	accessToken, refreshToken, idToken, tokenName, err := generateJwtTokenWithOptions(application, user, "", "", "", scope, targetAudience, host, jwtTokenOptions{Actor: actor})
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -997,6 +1034,7 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		CodeIsUsed:   true,
 		Resource:     targetAudience,
 		GrantType:    "urn:ietf:params:oauth:grant-type:token-exchange",
+		Actor:        getActorJson(actor),
 	}
 
 	_, err = AddToken(token)
@@ -1012,13 +1050,7 @@ func validateTokenExchangeSubjectBinding(subjectTokenRecord *Token, subjectToken
 		return nil
 	}
 
-	if subjectTokenRecord.DPoPJkt == "" && subjectTokenRecord.TokenType != "DPoP" {
-		return nil
-	}
-	return &TokenError{
-		Error:            InvalidGrant,
-		ErrorDescription: "exchange of sender-constrained subject tokens is not supported",
-	}
+	return validateUnboundTokenExchangeAccessToken(subjectTokenRecord, "subject")
 }
 
 // getSubjectTokenUser returns the user of an active subject token issued by Casdoor to the application, and the token's scope
@@ -1097,8 +1129,8 @@ func GetAccessTokenByUser(user *User, host string) (string, error) {
 
 // getFederatedTokenExchangeToken exchanges a token of an external issuer trusted by the application.
 // The verified token is the credential, so no client secret is involved.
-func getFederatedTokenExchangeToken(application *Application, credential *FederatedCredential, claims jwt.MapClaims, audience string, scope string, host string) (*Token, *TokenError, error) {
-	user, tokenError, err := getFederatedUser(application, credential, claims)
+func getFederatedTokenExchangeToken(application *Application, credential *FederatedCredential, claims jwt.MapClaims, audience string, scope string, host string, clientIp string, lang string) (*Token, *TokenError, error) {
+	user, tokenError, err := getFederatedUser(application, credential, claims, clientIp, lang)
 	if err != nil || tokenError != nil {
 		return nil, tokenError, err
 	}

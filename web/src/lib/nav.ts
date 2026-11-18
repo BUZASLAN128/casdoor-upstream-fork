@@ -31,7 +31,7 @@ export interface NavGroup {
   items: NavItem[];
 }
 
-const EnterpriseOnlyPages = ["/access-reviews", "/privileged-accounts", "/privileged-access", "/compliance"];
+const EnterpriseOnlyPages = ["/access-reviews", "/privileged-accounts", "/privileged-access", "/compliance", "/mcp-approvals"];
 
 /** The console navigation, mirroring the antd ManagementPage menu. */
 export function getNavGroups(account: Account | null | undefined): NavGroup[] {
@@ -50,7 +50,9 @@ export function getNavGroups(account: Account | null | undefined): NavGroup[] {
       {key: "/", label: i18next.t("general:Dashboard")},
       {key: "/shortcuts", label: i18next.t("general:Shortcuts")},
       {key: "/apps", label: i18next.t("general:Apps")},
-      ...(Setting.isLocalAdminUser(account) ? [{key: "/editions", label: i18next.t("edition:Editions and features")}] : []),
+      ...(Setting.isLocalAdminUser(account) && !Conf.isUpgradeHidden("Commercial")
+        ? [{key: "/editions", label: i18next.t("edition:Editions and features")}]
+        : []),
       ...(account.pendingAccessReviews > 0 ? [{key: "/my-access-reviews", label: i18next.t("enterprise:My access reviews")}] : []),
     ],
   });
@@ -136,6 +138,7 @@ export function getNavGroups(account: Account | null | undefined): NavGroup[] {
     items: [
       {key: "/agents", label: i18next.t("general:Agents")},
       {key: "/servers", label: i18next.t("general:MCP Servers")},
+      {key: "/mcp-approvals", label: i18next.t("server:Tool call approvals")},
       {key: "/server-store", label: i18next.t("general:MCP Store")},
       {key: "/entries", label: i18next.t("general:Entries")},
       {key: "/sites", label: i18next.t("general:Sites")},

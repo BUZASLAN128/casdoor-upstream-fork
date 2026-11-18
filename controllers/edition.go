@@ -82,8 +82,6 @@ func (c *ApiController) getEditionFeatureName(feature string) string {
 		return c.T("edition:Paid integrations")
 	case edition.FeatureTracing:
 		return c.T("edition:OpenTelemetry tracing")
-	case edition.FeatureRbac:
-		return c.T("edition:Role-based access control (RBAC)")
 	case edition.FeatureAbac:
 		return c.T("edition:Attribute-based access control (ABAC)")
 	case edition.FeatureGuomi:
@@ -124,6 +122,12 @@ func (c *ApiController) getEditionFeatureName(feature string) string {
 		return c.T("edition:Access reviews")
 	case edition.FeatureDelegatedAdmin:
 		return c.T("edition:Delegated administration")
+	case edition.FeatureMcpApproval:
+		return c.T("edition:MCP tool call approval")
+	case edition.FeatureScimProvisioning:
+		return c.T("edition:SCIM provisioning")
+	case edition.FeatureDbProvisioning:
+		return c.T("edition:Provisioning to legacy databases")
 	default:
 		return feature
 	}
