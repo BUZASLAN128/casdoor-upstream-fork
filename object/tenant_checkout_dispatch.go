@@ -201,14 +201,18 @@ func newGroupPaymentIntent(order *Order, payer *User, product *Product, provider
 	if err != nil {
 		return nil, nil, ErrGroupCheckoutUnavailable
 	}
-	payment := &Payment{Owner: order.Owner, Name: name, CreatedTime: util.GetCurrentTime(), DisplayName: name,
+	payment := &Payment{
+		Owner: order.Owner, Name: name, CreatedTime: util.GetCurrentTime(), DisplayName: name,
 		Provider: provider.Name, Type: provider.Type, Products: append([]string(nil), order.Products...), ProductsDisplayName: product.DisplayName,
 		Detail: product.Description, Currency: order.Currency, Price: order.Price, User: payer.Name, Group: order.Group, Order: order.Name,
-		PayUrl: success, SuccessUrl: success, State: pp.PaymentStateCreated, OutOrderId: string(dummyID)}
-	request := &pp.PayReq{ProviderName: provider.Name, ProductName: product.Name, PayerName: fmt.Sprintf("%s | %s", payer.Name, payer.DisplayName),
+		PayUrl: success, SuccessUrl: success, State: pp.PaymentStateCreated, OutOrderId: string(dummyID),
+	}
+	request := &pp.PayReq{
+		ProviderName: provider.Name, ProductName: product.Name, PayerName: fmt.Sprintf("%s | %s", payer.Name, payer.DisplayName),
 		PayerId: payer.Id, PayerEmail: payer.Email, PaymentName: name, ProductDisplayName: product.DisplayName, ProductDescription: product.Description,
 		ProductImage: product.Image, Price: order.Price, Currency: order.Currency, ReturnUrl: success,
-		NotifyUrl: fmt.Sprintf("%s/api/notify-payment/%s/%s", backend, order.Owner, name), PaymentEnv: conf.GetConfigString("paymentDeploymentEnvironment")}
+		NotifyUrl: fmt.Sprintf("%s/api/notify-payment/%s/%s", backend, order.Owner, name), PaymentEnv: conf.GetConfigString("paymentDeploymentEnvironment"),
+	}
 	return payment, request, nil
 }
 

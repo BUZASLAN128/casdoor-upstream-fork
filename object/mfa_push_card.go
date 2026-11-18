@@ -53,8 +53,10 @@ type PushChallenge struct {
 	mu            sync.Mutex
 }
 
-var pushChallenges sync.Map
-var pushChallengeApprovals sync.Map
+var (
+	pushChallenges         sync.Map
+	pushChallengeApprovals sync.Map
+)
 
 func expirePushChallengeLocked(challenge *PushChallenge, now time.Time) bool {
 	if (challenge.Status == PushChallengePending || challenge.Status == PushChallengeApproved) && !now.Before(challenge.CreatedTime.Add(pushChallengeLifetime)) {

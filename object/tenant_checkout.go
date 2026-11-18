@@ -18,8 +18,10 @@ import (
 	"github.com/xorm-io/xorm"
 )
 
-var ErrGroupCheckoutConflict = errors.New("GROUP_CHECKOUT_CONFLICT")
-var ErrTenantCheckoutRequired = errors.New("TENANT_CHECKOUT_REQUIRED")
+var (
+	ErrGroupCheckoutConflict  = errors.New("GROUP_CHECKOUT_CONFLICT")
+	ErrTenantCheckoutRequired = errors.New("TENANT_CHECKOUT_REQUIRED")
+)
 
 type tenantCheckoutConfig struct {
 	application  string
@@ -497,9 +499,11 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 		}
 		if !packageCheckout {
 			terms := order.CheckoutTerms
-			sub := &Subscription{Owner: order.Owner, Name: "sub_" + order.Name, DisplayName: "Subscription - " + order.Name, CreatedTime: checkoutTimestamp(now),
+			sub := &Subscription{
+				Owner: order.Owner, Name: "sub_" + order.Name, DisplayName: "Subscription - " + order.Name, CreatedTime: checkoutTimestamp(now),
 				Group: order.Group, Plan: info.PlanName, Pricing: info.PricingName, Payment: stored.Name,
-				StartTime: terms.StartTime, EndTime: terms.EndTime, Period: terms.Period, State: SubStateActive}
+				StartTime: terms.StartTime, EndTime: terms.EndTime, Period: terms.Period, State: SubStateActive,
+			}
 			sub.State, err = effectiveGroupPeriodState(sub, now)
 			if err != nil {
 				return nil, err
