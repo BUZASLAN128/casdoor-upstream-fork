@@ -1710,6 +1710,7 @@
     "You have no requests yet": "You have no requests yet"
   },
   "payment": {
+    "Back to Cerberus": "Back to Cerberus",
     "Confirm your invoice information": "Confirm your invoice information",
     "Currency": "Currency",
     "Currency - Tooltip": "Like USD, CNY, etc.",
@@ -1750,6 +1751,7 @@
     "The payment has failed": "The payment has failed",
     "The payment has timed out": "The payment has timed out",
     "The payment is still under processing": "The payment is still under processing",
+    "The plan status shows under Service summary on your Cerberus Dashboard": "The plan status shows under Service summary on your Cerberus Dashboard.",
     "View Payment": "View Payment",
     "You can view your order details or return to the order list": "You can view your order details or return to the order list",
     "You have successfully completed the payment": "You have successfully completed the payment",
@@ -1824,7 +1826,7 @@
     "Detail - Tooltip": "Detail of product",
     "Disable custom amount": "Disable custom amount",
     "Disable custom amount - Tooltip": "Whether to disable custom recharge amounts",
-    "Dummy": "Dummy",
+    "Dummy": "Test payment",
     "Edit Product": "Edit Product",
     "Enter preset amounts": "Enter preset amounts",
     "Failed to create order": "Failed to create order",
@@ -1843,6 +1845,7 @@
     "Payment providers": "Payment providers",
     "Payment providers - Tooltip": "Providers of payment services",
     "Placing order...": "Placing order...",
+    "Plans are bought from Service summary on the Dashboard": "Plans are bought from Service summary on the Dashboard.",
     "Please add at least one recharge option when custom amount is disabled": "Please add at least one recharge option when custom amount is disabled",
     "Please select a currency": "Please select a currency",
     "Please select at least one payment provider": "Please select at least one payment provider",

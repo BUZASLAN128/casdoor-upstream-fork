@@ -1708,6 +1708,7 @@
     "You have no requests yet": "Henüz talebiniz yok"
   },
   "payment": {
+    "Back to Cerberus": "Cerberus'a dön",
     "Confirm your invoice information": "Fatura bilgilerinizi onaylayın",
     "Currency": "Para birimi",
     "Currency - Tooltip": "USD, CNY vb. gibi",
@@ -1748,6 +1749,7 @@
     "The payment has failed": "Ödeme başarısız oldu",
     "The payment has timed out": "Ödeme zaman aşımına uğradı",
     "The payment is still under processing": "Ödeme hala işleniyor",
+    "The plan status shows under Service summary on your Cerberus Dashboard": "Plan durumu Cerberus'ta Panel'deki Hizmet özeti bölümünde görünür.",
     "View Payment": "Ödemeyi Görüntüle",
     "You can view your order details or return to the order list": "Sipariş ayrıntılarını görüntüleyebilir veya sipariş listesine dönebilirsiniz",
     "You have successfully completed the payment": "Ödemeyi başarıyla tamamladınız",
@@ -1822,7 +1824,7 @@
     "Detail - Tooltip": "Ürün detayı",
     "Disable custom amount": "Özel tutarı devre dışı bırak",
     "Disable custom amount - Tooltip": "Özel tutarı devre dışı bırak - Araç ipucu",
-    "Dummy": "Kukla",
+    "Dummy": "Test ödemesi",
     "Edit Product": "Ürünü Düzenle",
     "Enter preset amounts": "Ön tanımlı tutarları gir",
     "Failed to create order": "Sipariş oluşturulamadı",
@@ -1841,6 +1843,7 @@
     "Payment providers": "Ödeme sağlayıcıları",
     "Payment providers - Tooltip": "Ödeme hizmetleri sağlayıcıları",
     "Placing order...": "Sipariş veriliyor...",
+    "Plans are bought from Service summary on the Dashboard": "Plan, Panel'deki Hizmet özeti bölümünden satın alınır.",
     "Please add at least one recharge option when custom amount is disabled": "Özel tutar devre dışıyken en az bir yeniden yükleme seçeneği ekleyin",
     "Please select a currency": "Lütfen bir para birimi seçin",
     "Please select at least one payment provider": "Lütfen en az bir ödeme sağlayıcısı seçin",

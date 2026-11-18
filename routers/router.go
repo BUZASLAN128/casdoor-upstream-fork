@@ -338,6 +338,7 @@ func InitAPI() {
 	web.Router("/api/add-order", &controllers.ApiController{}, "POST:AddOrder")
 	web.Router("/api/delete-order", &controllers.ApiController{}, "POST:DeleteOrder")
 	web.Router("/api/place-order", &controllers.ApiController{}, "POST:PlaceOrder")
+	web.Router("/api/get-group-checkout", &controllers.ApiController{}, "GET:GetGroupCheckout")
 	web.Router("/api/cancel-order", &controllers.ApiController{}, "POST:CancelOrder")
 	web.Router("/api/pay-order", &controllers.ApiController{}, "POST:PayOrder")
 

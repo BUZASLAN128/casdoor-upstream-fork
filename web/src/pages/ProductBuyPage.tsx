@@ -1,6 +1,6 @@
 import * as React from "react";
 import i18next from "i18next";
-import {useNavigate, useParams, useSearchParams} from "react-router-dom";
+import {useLocation, useNavigate, useParams, useSearchParams} from "react-router-dom";
 import {Button} from "@/components/ui/button";
 import {Input} from "@/components/ui/input";
 import {Loading} from "@/components/common/Loading";
@@ -13,11 +13,53 @@ import * as PricingBackend from "@/backend/PricingBackend";
 import * as ProductBackend from "@/backend/ProductBackend";
 import * as UserBackend from "@/backend/UserBackend";
 import * as Setting from "@/lib/setting";
+import OrderPayPage, {getOrderErrorText} from "@/pages/OrderPayPage";
 
-/** WeChat Pay only works inside the WeChat mobile browser. */
-export function getPaymentEnv() {
-  const ua = navigator.userAgent.toLowerCase();
-  return ua.indexOf("micromessenger") !== -1 && ua.indexOf("mobile") !== -1 ? "WechatBrowser" : "";
+export default function ProductBuyPage() {
+  const params = useParams();
+  const [search] = useSearchParams();
+  const orderName = search.get("order");
+
+  if (params.pricingName && orderName) {
+    return (
+      <PricingOrderPay
+        owner={params.organizationName ?? params.owner ?? ""}
+        pricingName={params.pricingName}
+        orderName={orderName}
+      />
+    );
+  }
+  return <ProductBuyForm />;
+}
+
+/**
+ * /buy-plan/:owner/:pricingName?order=<name> resumes an order the server already
+ * placed. Plan, payer and product come from the stored order, never from the URL,
+ * and the page stays outside the console so console-disabled users can pay.
+ */
+function PricingOrderPay({owner, pricingName, orderName}: {owner: string; pricingName: string; orderName: string}) {
+  const {account, loading} = useAccount();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const signedOut = !loading && account === null;
+
+  React.useEffect(() => {
+    const here = location.pathname + location.search;
+    if (signedOut) {
+      // the login page keeps state.from as its return link
+      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true, state: {from: here}});
+    } else if (account && sessionStorage.getItem("from") === here) {
+      // back from login: later sign-ins in this tab must not return to this order
+      sessionStorage.removeItem("from");
+    }
+  }, [signedOut, account, location.pathname, location.search, navigate, owner]);
+
+  if (loading || !account) {
+    return <Loading className="min-h-screen" />;
+  }
+  // an account of another organization is never the payer, whatever its name
+  const payer = account.owner === owner ? account.name : "";
+  return <OrderPayPage owner={owner} orderName={orderName} pricingName={pricingName} payer={payer} />;
 }
 
 /**
@@ -25,11 +67,13 @@ export function getPaymentEnv() {
  * pricing plan (/buy-plan/:owner/:pricingName?plan=&user=). Ported from
  * web/src/ProductBuyPage.js — the place-order payload is unchanged.
  */
-export default function ProductBuyPage() {
+function ProductBuyForm() {
   const params = useParams();
   const [search] = useSearchParams();
   const navigate = useNavigate();
   const {account} = useAccount();
+  // same condition as RequireConsoleAccess: the cart and order pages are console routes
+  const consoleClosed = Boolean(account?.organization?.disableConsole) && !Setting.isLocalAdminUser(account);
 
   const owner = params.organizationName ?? params.owner ?? "";
   const pricingName = params.pricingName ?? "";
@@ -191,9 +235,12 @@ export default function ProductBuyPage() {
       .then((res: any) => {
         if (res.status === "ok") {
           Setting.showMessage("success", i18next.t("product:Order created successfully"));
-          navigate(`/orders/${res.data.owner}/${res.data.name}/pay`);
+          // the console order page is closed to console-disabled payers; a plan order is paid on the public route
+          navigate(consoleClosed && pricingName
+            ? `/buy-plan/${encodeURIComponent(res.data.owner)}/${encodeURIComponent(pricingName)}?order=${encodeURIComponent(res.data.name)}`
+            : `/orders/${res.data.owner}/${res.data.name}/pay`);
         } else {
-          Setting.showMessage("error", `${i18next.t("product:Failed to create order")}: ${res.msg}`);
+          Setting.showMessage("error", `${i18next.t("product:Failed to create order")}: ${getOrderErrorText(res.msg)}`);
           setPlacingOrder(false);
         }
       })
@@ -256,7 +303,7 @@ export default function ProductBuyPage() {
 
   return (
     <div className="mx-auto max-w-4xl space-y-4 py-4">
-      <FloatingCartButton itemCount={cartItemCount} />
+      {consoleClosed ? null : <FloatingCartButton itemCount={cartItemCount} />}
       <h1 className="text-2xl font-semibold">{i18next.t("product:Buy Product")}</h1>
 
       <div className="divide-y divide-border/60 rounded-lg border px-4">
@@ -308,15 +355,17 @@ export default function ProductBuyPage() {
                 onDecrease={() => setBuyQuantity((q) => Math.max(1, q - 1))}
                 onChange={(value) => setBuyQuantity(value || 1)}
               />
-              <Button
-                variant="outline"
-                size="lg"
-                loading={addingToCart}
-                disabled={isRechargeUnpurchasable || isAmountZero}
-                onClick={addToCart}
-              >
-                {i18next.t("product:Add to cart")}
-              </Button>
+              {consoleClosed ? null : (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  loading={addingToCart}
+                  disabled={isRechargeUnpurchasable || isAmountZero}
+                  onClick={addToCart}
+                >
+                  {i18next.t("product:Add to cart")}
+                </Button>
+              )}
               <Button
                 size="lg"
                 loading={placingOrder}

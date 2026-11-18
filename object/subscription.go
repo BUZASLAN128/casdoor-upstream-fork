@@ -155,6 +155,9 @@ func calculateSubscriptionStateInSession(session *xorm.Session, candidate *Subsc
 			candidate.Description = fmt.Sprintf("payment: %s does not exist", candidate.Payment)
 			candidate.State = SubStateError
 		} else {
+			if err := checkDummyPayment(payment.Type); err != nil {
+				return err
+			}
 			if payment.State == pp.PaymentStatePaid {
 				candidate.State = SubStateActive
 			} else if payment.State != pp.PaymentStateCreated {
@@ -176,7 +179,9 @@ func calculateSubscriptionStateInSession(session *xorm.Session, candidate *Subsc
 			return err
 		}
 
-		if endTime.Before(now) {
+		if candidate.Group != "" && !now.Before(endTime) {
+			candidate.State = SubStateExpired
+		} else if endTime.Before(now) {
 			candidate.State = SubStateExpired
 		} else if startTime.After(now) {
 			candidate.State = SubStateUpcoming
@@ -474,6 +479,9 @@ func UpdateSubscription(id string, subscription *Subscription) (bool, error) {
 	updated := *subscription
 	updated.Owner = owner
 	updated.Name = name
+	if err := validateTenantSubscriptionPayment(&updated); err != nil {
+		return false, err
+	}
 	if updated.AutoRenew && !preUpdate.AutoRenew {
 		if err = checkSubscriptionAutoRenew(&updated); err != nil {
 			return false, err
@@ -505,6 +513,16 @@ func UpdateSubscription(id string, subscription *Subscription) (bool, error) {
 	if oldSubscription.AutoRenew != preUpdate.AutoRenew {
 		return rollback(fmt.Errorf("the subscription changed concurrently: %s", id))
 	}
+	if oldSubscription.Payment != "" {
+		payment := &Payment{Owner: owner, Name: oldSubscription.Payment}
+		found, err := session.Get(payment)
+		if err != nil {
+			return rollback(err)
+		}
+		if found && payment.Group != "" && !samePaidGroupSubscriptionTerms(oldSubscription, &updated) {
+			return rollback(fmt.Errorf("tenant subscription context is immutable"))
+		}
+	}
 
 	affected, err := session.ID(core.PK{owner, name}).AllCols().Omit("renewal_state", "renewal_subscription", "renewal_message").Update(&updated)
 	if err != nil {
@@ -526,6 +544,18 @@ func UpdateSubscription(id string, subscription *Subscription) (bool, error) {
 }
 
 func AddSubscription(subscription *Subscription) (bool, error) {
+	if subscription.Payment != "" {
+		payment, err := GetPayment(util.GetId(subscription.Owner, subscription.Payment))
+		if err != nil {
+			return false, err
+		}
+		if payment != nil && payment.Group != "" {
+			return false, ErrGroupCheckoutConflict
+		}
+	}
+	if err := validateTenantSubscriptionPayment(subscription); err != nil {
+		return false, err
+	}
 	session := ormer.Engine.NewSession()
 	defer session.Close()
 	if err := session.Begin(); err != nil {
@@ -578,6 +608,17 @@ func DeleteSubscription(subscription *Subscription) (bool, error) {
 		return false, nil
 	}
 
+	if oldSubscription.Payment != "" {
+		payment := &Payment{Owner: oldSubscription.Owner, Name: oldSubscription.Payment}
+		found, err := session.Get(payment)
+		if err != nil {
+			return rollback(err)
+		}
+		if found && payment.Group != "" {
+			return rollback(ErrGroupCheckoutConflict)
+		}
+	}
+
 	affected, err := session.ID(core.PK{subscription.Owner, subscription.Name}).Delete(&Subscription{})
 	if err != nil {
 		return rollback(err)
@@ -591,4 +632,8 @@ func DeleteSubscription(subscription *Subscription) (bool, error) {
 		return rollback(err)
 	}
 	return affected != 0, nil
+}
+
+func samePaidGroupSubscriptionTerms(old, updated *Subscription) bool {
+	return old.Owner == updated.Owner && old.Name == updated.Name && old.Group == updated.Group && old.User == updated.User && old.Payment == updated.Payment && old.Plan == updated.Plan && old.Pricing == updated.Pricing && old.StartTime == updated.StartTime && old.EndTime == updated.EndTime && old.Period == updated.Period && old.CreatedTime == updated.CreatedTime
 }

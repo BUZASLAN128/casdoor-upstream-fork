@@ -41,11 +41,14 @@ type Payment struct {
 	Price               float64  `json:"price"`
 
 	// Payer Info
-	User         string `xorm:"varchar(100)" json:"user"`
-	PersonName   string `xorm:"varchar(100)" json:"personName"`
-	PersonIdCard string `xorm:"varchar(100)" json:"personIdCard"`
-	PersonEmail  string `xorm:"varchar(100)" json:"personEmail"`
-	PersonPhone  string `xorm:"varchar(100)" json:"personPhone"`
+	User  string `xorm:"varchar(100)" json:"user"`
+	Group string `xorm:"varchar(100) index" json:"group"`
+	// Set only by the canonical Group claim transaction, never browser JSON.
+	GroupStockReserved bool   `xorm:"notnull default false" json:"-"`
+	PersonName         string `xorm:"varchar(100)" json:"personName"`
+	PersonIdCard       string `xorm:"varchar(100)" json:"personIdCard"`
+	PersonEmail        string `xorm:"varchar(100)" json:"personEmail"`
+	PersonPhone        string `xorm:"varchar(100)" json:"personPhone"`
 	// Invoice Info
 	InvoiceType   string `xorm:"varchar(100)" json:"invoiceType"`
 	InvoiceTitle  string `xorm:"varchar(100)" json:"invoiceTitle"`
@@ -183,6 +186,12 @@ func UpdatePayment(id string, payment *Payment) (bool, error) {
 		return false, err
 	} else if p == nil {
 		return false, nil
+	} else if p.Group != payment.Group || (p.Group != "" && (p.Owner != payment.Owner || p.Name != payment.Name || p.Order != payment.Order || p.User != payment.User || p.Provider != payment.Provider || p.Type != payment.Type || p.Price != payment.Price || p.Currency != payment.Currency || p.OutOrderId != payment.OutOrderId)) {
+		return false, fmt.Errorf("tenant payment context is immutable")
+	}
+
+	if payment.Group != "" {
+		return false, ErrGroupCheckoutConflict
 	}
 
 	affected, err := ormer.Engine.ID(core.PK{owner, name}).AllCols().Update(payment)
@@ -214,6 +223,14 @@ func AddPayment(payment *Payment) (bool, error) {
 }
 
 func DeletePayment(payment *Payment) (bool, error) {
+	stored, err := GetPayment(payment.GetId())
+	if err != nil {
+		return false, err
+	}
+	if stored != nil && stored.Group != "" {
+		return false, ErrGroupCheckoutConflict
+	}
+
 	affected, err := ormer.Engine.ID(core.PK{payment.Owner, payment.Name}).Delete(&Payment{})
 	if err != nil {
 		return false, err
@@ -231,22 +248,51 @@ func notifyPayment(body []byte, owner string, paymentName string) (*Payment, *pp
 		err = fmt.Errorf("the payment: %s does not exist", paymentName)
 		return nil, nil, err
 	}
-
-	provider, err := getProvider(owner, payment.Provider)
-	if err != nil {
+	if err = checkDummyPayment(payment.Type); err != nil {
 		return nil, nil, err
+	}
+	if payment.Group != "" {
+		if err := checkGroupPaymentType(payment.Type); err != nil {
+			return nil, nil, err
+		}
+	}
+	if payment.Order != "" {
+		order, err := GetOrder(util.GetId(payment.Owner, payment.Order))
+		if err != nil {
+			return nil, nil, err
+		}
+		if payment.Group != "" || (order != nil && order.Group != "") {
+			if err = validateGroupPayment(order, payment); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
+	var provider *Provider
+	if payment.Group != "" {
+		if !payment.GroupStockReserved {
+			return payment, nil, ErrGroupCheckoutConflict
+		}
+		// A committed Dummy intent needs no mutable catalog/credential row to
+		// confirm its stored native identity. Deployment-wide policy still gates it.
+		provider = &Provider{Type: payment.Type}
+	} else {
+		provider, err = getProvider(owner, payment.Provider)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	pProvider, err := GetPaymentProvider(provider)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Check if the order products exist
-	_, err = getOrderProducts(owner, payment.Products)
-	if err != nil {
-		return nil, nil, err
+	if payment.Group == "" {
+		// Preserve the native personal-provider/catalog contract.
+		if _, err = getOrderProducts(owner, payment.Products); err != nil {
+			return nil, nil, err
+		}
 	}
-
 	notifyResult, err := pProvider.Notify(body, payment.OutOrderId)
 	if err != nil {
 		return nil, nil, err
@@ -275,6 +321,9 @@ func NotifyPayment(body []byte, owner string, paymentName string, lang string) (
 			return nil, err
 		}
 		return nil, fmt.Errorf("the payment: %s does not exist", paymentName)
+	}
+	if payment.Group != "" {
+		return completeGroupPayment(payment, notifyResult, err)
 	}
 
 	// Check if payment is already in a terminal state to prevent duplicate processing

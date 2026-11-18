@@ -74,6 +74,21 @@ func checkOrderUser(owner string, user *User) error {
 }
 
 func PlaceOrder(owner string, reqProductInfos []ProductInfo, user *User, couponCode string) (*Order, error) {
+	if err := CheckTenantCheckoutRequest("", owner, "", reqProductInfos); err != nil {
+		return nil, err
+	}
+	order, err := newOrder(owner, reqProductInfos, user, couponCode)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := AddOrder(order)
+	if err == nil && !affected {
+		return nil, fmt.Errorf("failed to add order: %s", order.Name)
+	}
+	return order, err
+}
+
+func newOrder(owner string, reqProductInfos []ProductInfo, user *User, couponCode string) (*Order, error) {
 	if len(reqProductInfos) == 0 {
 		return nil, fmt.Errorf("order has no products")
 	}
@@ -189,14 +204,6 @@ func PlaceOrder(owner string, reqProductInfos []ProductInfo, user *User, couponC
 		CouponDiscount: couponDiscount,
 	}
 
-	affected, err := AddOrder(order)
-	if err != nil {
-		return nil, err
-	}
-	if !affected {
-		return nil, fmt.Errorf("failed to add order: %s", util.StructToJson(order))
-	}
-
 	return order, nil
 }
 
@@ -216,6 +223,21 @@ func getOrderProvider(products []Product, providerName string) (*Provider, error
 }
 
 func PayOrder(providerName, host, paymentEnv string, order *Order, autoRenew *bool, lang string) (payment *Payment, attachInfo map[string]interface{}, err error) {
+	if order.Group != "" {
+		// Group dispatch requires the configured application's typed admission.
+		return nil, nil, ErrTenantCheckoutRequired
+	}
+	if err := CheckTenantCheckoutRequest("", order.Owner, "", order.ProductInfos); err != nil {
+		return nil, nil, err
+	}
+	return payOrder(providerName, host, paymentEnv, order, autoRenew, lang)
+}
+
+func payOrder(providerName, host, paymentEnv string, order *Order, autoRenew *bool, lang string) (payment *Payment, attachInfo map[string]interface{}, err error) {
+	if order.Group != "" {
+		return nil, nil, ErrGroupCheckoutUnavailable
+	}
+
 	if order.State != "Created" {
 		return nil, nil, fmt.Errorf("cannot pay for order: %s, current state is %s", order.GetId(), order.State)
 	}
@@ -275,6 +297,10 @@ func PayOrder(providerName, host, paymentEnv string, order *Order, autoRenew *bo
 	// Create a subscription when pricing and plan are provided
 	// This allows both free users and paid users to subscribe to plans
 	for i, productInfo := range orderProductInfos {
+		// Tenant subscriptions are created atomically on provider-confirmed payment.
+		if order.Group != "" {
+			break
+		}
 		if productInfo.PricingName == "" || productInfo.PlanName == "" {
 			continue
 		}
@@ -325,7 +351,7 @@ func PayOrder(providerName, host, paymentEnv string, order *Order, autoRenew *bo
 		}
 	}
 
-	if baseProduct.SuccessUrl != "" {
+	if baseProduct.SuccessUrl != "" && order.Group == "" {
 		returnUrl = fmt.Sprintf("%s?transactionOwner=%s&transactionName=%s", baseProduct.SuccessUrl, owner, paymentName)
 	}
 
@@ -387,6 +413,7 @@ func PayOrder(providerName, host, paymentEnv string, order *Order, autoRenew *bo
 		Price:               order.Price,
 
 		User:       user.Name,
+		Group:      order.Group,
 		Order:      order.Name,
 		PayUrl:     payResp.PayUrl,
 		SuccessUrl: returnUrl,
@@ -522,6 +549,15 @@ func checkBalanceForPayment(provider *Provider, order *Order, lang string) error
 }
 
 func CancelOrder(order *Order) (bool, error) {
+	stored, err := GetOrder(order.GetId())
+	if err != nil {
+		return false, err
+	}
+	if stored != nil && stored.Group != "" {
+		// Group cancellation requires the configured App's real actor and revision.
+		return false, ErrGroupCheckoutConflict
+	}
+
 	if order.State != "Created" {
 		return false, fmt.Errorf("cannot cancel order in state: %s", order.State)
 	}

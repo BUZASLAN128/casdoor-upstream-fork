@@ -174,6 +174,11 @@ func (c *ApiController) UpdatePayment() {
 		c.ResponseError(err.Error())
 		return
 	}
+	stored, err := object.GetPayment(id)
+	if err != nil || payment.Group != "" || (stored != nil && stored.Group != "") {
+		c.ResponseError("tenant checkout payments cannot be edited")
+		return
+	}
 
 	c.Data["json"] = wrapActionResponse(object.UpdatePayment(id, &payment))
 	c.ServeJSON()
@@ -191,6 +196,10 @@ func (c *ApiController) AddPayment() {
 	err := json.Unmarshal(c.Ctx.Input.RequestBody, &payment)
 	if err != nil {
 		c.ResponseError(err.Error())
+		return
+	}
+	if payment.Group != "" {
+		c.ResponseError("tenant checkout payments are created by payment execution")
 		return
 	}
 

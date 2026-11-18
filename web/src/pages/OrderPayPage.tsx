@@ -5,7 +5,6 @@ import {Button} from "@/components/ui/button";
 import {Switch} from "@/components/ui/switch";
 import {Loading} from "@/components/common/Loading";
 import {FormRow} from "@/components/crud/FormRow";
-import {getPaymentEnv} from "@/pages/ProductBuyPage";
 import * as OrderBackend from "@/backend/OrderBackend";
 import * as PlanBackend from "@/backend/PlanBackend";
 import * as ProductBackend from "@/backend/ProductBackend";
@@ -22,18 +21,48 @@ const PROVIDER_TEXT: Record<string, string> = {
   "AirWallex": "product:AirWallex",
 };
 
+/** WeChat Pay only works inside the WeChat mobile browser. */
+export function getPaymentEnv() {
+  const ua = navigator.userAgent.toLowerCase();
+  return ua.indexOf("micromessenger") !== -1 && ua.indexOf("mobile") !== -1 ? "WechatBrowser" : "";
+}
+
+/** A tenant plan cannot be bought as a personal order; the server says so with this code. */
+export function getOrderErrorText(msg: string) {
+  return msg === "TENANT_CHECKOUT_REQUIRED" ? i18next.t("product:Plans are bought from Service summary on the Dashboard") : msg;
+}
+
+function isPricingOrder(order: any, owner: string, pricingName: string, payer: string) {
+  return payer !== "" &&
+    order?.owner === owner &&
+    order.user === payer &&
+    order.productInfos?.length > 0 &&
+    order.productInfos.every((info: any) => info.pricingName === pricingName && info.planName);
+}
+
+interface OrderPayPageProps {
+  owner?: string;
+  orderName?: string;
+  /** Set on /buy-plan/:owner/:pricingName?order=: only the payer's plan order of this pricing is shown. */
+  pricingName?: string;
+  payer?: string;
+}
+
 /**
  * Pays an order: shows what was ordered and one button per payment provider the
  * product supports. Ported from web/src/OrderPayPage.js, including the WeChat
  * JSAPI path inside the WeChat browser and the QR-code redirect outside it.
  */
-export default function OrderPayPage() {
+export default function OrderPayPage(props: OrderPayPageProps) {
   const params = useParams();
   const navigate = useNavigate();
-  const owner = params.organizationName ?? params.owner ?? "";
-  const orderName = params.orderName ?? "";
+  const owner = props.owner ?? params.organizationName ?? params.owner ?? "";
+  const orderName = props.orderName ?? params.orderName ?? "";
+  const pricingName = props.pricingName;
+  const payer = props.payer ?? "";
 
   const [order, setOrder] = React.useState<any>(null);
+  const [notFound, setNotFound] = React.useState(false);
   const [firstProduct, setFirstProduct] = React.useState<any>(null);
   const [processing, setProcessing] = React.useState(false);
   const [autoRenew, setAutoRenew] = React.useState(false);
@@ -43,9 +72,21 @@ export default function OrderPayPage() {
     if (!owner || !orderName) {
       return;
     }
+    setOrder(null);
+    setFirstProduct(null);
+    setNotFound(false);
+    const fail = (msg: string) => {
+      Setting.showMessage("error", msg);
+      setNotFound(pricingName !== undefined);
+    };
+
     OrderBackend.getOrder(owner, orderName).then((res: any) => {
       if (res.status !== "ok") {
-        Setting.showMessage("error", res.msg);
+        fail(getOrderErrorText(res.msg));
+        return;
+      }
+      if (pricingName !== undefined && !isPricingOrder(res.data, owner, pricingName, payer)) {
+        setNotFound(true);
         return;
       }
       setOrder(res.data);
@@ -70,8 +111,8 @@ export default function OrderPayPage() {
           Setting.showMessage("error", productRes.msg);
         }
       });
-    });
-  }, [owner, orderName]);
+    }).catch((error: any) => fail(`${i18next.t("general:Failed to connect to server")}: ${error}`));
+  }, [owner, orderName, pricingName, payer]);
 
   const hasPlan = Boolean(order?.productInfos?.some((info: any) => info.pricingName && info.planName));
 
@@ -117,7 +158,7 @@ export default function OrderPayPage() {
     OrderBackend.payOrder(order.owner, order.name, provider.name, paymentEnv, hasPlan ? autoRenew : null)
       .then((res: any) => {
         if (res.status !== "ok") {
-          Setting.showMessage("error", `${i18next.t("product:Payment failed")}: ${res.msg}`);
+          Setting.showMessage("error", `${i18next.t("product:Payment failed")}: ${getOrderErrorText(res.msg)}`);
           setProcessing(false);
           return;
         }
@@ -141,6 +182,14 @@ export default function OrderPayPage() {
         setProcessing(false);
       });
   };
+
+  if (notFound) {
+    return (
+      <div className="mx-auto max-w-4xl py-4">
+        <p className="text-muted-foreground">{i18next.t("order:Order not found")}</p>
+      </div>
+    );
+  }
 
   if (order === null || !order.productInfos) {
     return <Loading />;
@@ -266,11 +315,13 @@ export default function OrderPayPage() {
         </div>
       </div>
 
-      <div>
-        <Button variant="outline" onClick={() => navigate("/orders")}>
-          {i18next.t("order:Return to Order List")}
-        </Button>
-      </div>
+      {pricingName === undefined ? (
+        <div>
+          <Button variant="outline" onClick={() => navigate("/orders")}>
+            {i18next.t("order:Return to Order List")}
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }
