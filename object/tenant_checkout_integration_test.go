@@ -30,7 +30,8 @@ func checkoutFixtureAdmission(order *Order) GroupPaymentAdmission {
 	return GroupPaymentAdmission{Principal: principal, Owner: order.Owner, Group: order.Group, OrderName: order.Name, PayerName: order.User, ExpectedCheckoutRevision: order.CheckoutRevision}
 }
 
-func TestTenantCheckoutDisposablePersistence(t *testing.T) {
+func setupTenantCheckoutMemoryFixture(t *testing.T) (*xorm.Engine, *User, []ProductInfo) {
+	t.Helper()
 	if os.Getenv("CASDOOR_TENANT_CHECKOUT_TEST_DB") != "memory" {
 		t.Skip("requires explicit CASDOOR_TENANT_CHECKOUT_TEST_DB=memory on an authorized test host")
 	}
@@ -43,7 +44,7 @@ func TestTenantCheckoutDisposablePersistence(t *testing.T) {
 	}
 	ormer = &Ormer{Engine: engine, driverName: "sqlite"}
 	t.Cleanup(func() { ormer = nil; engine.Close() })
-	if err = engine.Sync2(&Order{}, &Payment{}, &Subscription{}, &Group{}, &User{}, &Pricing{}, &Plan{}, &Product{}, &Provider{}, &Application{}, &Transaction{}); err != nil {
+	if err = engine.Sync2(&Order{}, &Payment{}, &Subscription{}, &Group{}, &User{}, &Pricing{}, &Plan{}, &Product{}, &Provider{}, &Application{}, &Transaction{}, &ThirdPartyLink{}, &Organization{}, &Role{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("tenantCheckoutApplication", "app/cerberus")
@@ -55,6 +56,8 @@ func TestTenantCheckoutDisposablePersistence(t *testing.T) {
 	t.Setenv("originFrontend", "")
 	payer := &User{Owner: "org", Name: "payer", Groups: []string{"org/tenant"}}
 	for _, row := range []interface{}{
+		&Organization{Owner: "admin", Name: "org"},
+		&Role{Owner: "org", Name: "unrelated-platform-role"},
 		&Application{Owner: "admin", Name: "cerberus", Organization: "org"},
 		&Group{Owner: "org", Name: "tenant", IsEnabled: true},
 		payer,
@@ -70,6 +73,11 @@ func TestTenantCheckoutDisposablePersistence(t *testing.T) {
 		}
 	}
 	infos := []ProductInfo{{Name: "product", PlanName: "plan", PricingName: "pricing", Quantity: 1}}
+	return engine, payer, infos
+}
+
+func TestTenantCheckoutDisposablePersistence(t *testing.T) {
+	engine, payer, infos := setupTenantCheckoutMemoryFixture(t)
 	order, err := PlaceGroupOrder("app/cerberus", "org", "tenant", infos, payer, "none")
 	if err != nil {
 		t.Fatal(err)
@@ -139,8 +147,15 @@ func TestTenantCheckoutDisposablePersistence(t *testing.T) {
 		t.Fatalf("active direct subscription must conflict: %v", err)
 	}
 	storedPayer, err := GetUser("org/payer")
-	if err != nil || len(storedPayer.Roles) != 0 {
+	if err != nil || storedPayer == nil {
+		t.Fatalf("read fixture payer: %v", err)
+	}
+	if len(storedPayer.Roles) != 0 {
 		t.Fatal("plan role leaked into user privileges")
+	}
+	role := &Role{Owner: "org", Name: "unrelated-platform-role"}
+	if found, err := engine.Get(role); err != nil || !found || len(role.Users) != 0 || len(role.Groups) != 0 {
+		t.Fatalf("group settlement changed the plan role: found=%t err=%v", found, err)
 	}
 	personalInfos := []ProductInfo{{Name: "product", PlanName: "plan", PricingName: "personal", Quantity: 1}}
 	personalOrder, err := PlaceOrder("org", personalInfos, payer, "")
@@ -676,7 +691,7 @@ func setupTenantCheckoutReplacementAbuseFixture(t *testing.T) (*xorm.Engine, *Us
 	})
 	// Task database only, with per-run synthetic organizations retained after
 	// RED and GREEN; no DROP, TRUNCATE, Reset or existing fixture overwrite.
-	if err := engine.Sync2(&Order{}, &Payment{}, &Subscription{}, &Group{}, &User{}, &Pricing{}, &Plan{}, &Product{}, &Provider{}, &Application{}, &Transaction{}); err != nil {
+	if err := engine.Sync2(&Order{}, &Payment{}, &Subscription{}, &Group{}, &User{}, &Pricing{}, &Plan{}, &Product{}, &Provider{}, &Application{}, &Transaction{}, &Organization{}); err != nil {
 		t.Fatal("disposable checkout table setup failed")
 	}
 	org := "abuse_" + strings.ReplaceAll(util.GenerateId(), "-", "")
@@ -691,7 +706,7 @@ func setupTenantCheckoutReplacementAbuseFixture(t *testing.T) (*xorm.Engine, *Us
 	t.Setenv("originFrontend", "")
 	payer := &User{Owner: org, Name: "payer", Groups: []string{org + "/tenant"}} // no verified recipient or Email provider
 	for _, row := range []interface{}{
-		&Application{Owner: "admin", Name: org, Organization: org}, &Group{Owner: org, Name: "tenant", IsEnabled: true}, payer,
+		&Organization{Owner: "admin", Name: org}, &Application{Owner: "admin", Name: org, Organization: org}, &Group{Owner: org, Name: "tenant", IsEnabled: true}, payer,
 		&Provider{Owner: org, Name: provider, Category: "Payment", Type: "Dummy"},
 		&Product{Owner: org, Name: "product", Price: 5, Currency: "USD", Quantity: 10, Providers: []string{provider}},
 		&Plan{Owner: org, Name: "plan", Product: "product", Period: PeriodMonthly, IsEnabled: true},
@@ -1257,12 +1272,21 @@ func TestTenantCheckoutReservedIntentSurvivesCatalogMutationAndGroupDisable(t *t
 			if err != nil || !payment.GroupStockReserved {
 				t.Fatal("claim failed")
 			}
+			setPlanProduct := func(name string) {
+				t.Helper()
+				n, err := engine.Where("owner = ? AND name = ?", payer.Owner, infos[0].PlanName).Cols("product").Update(&Plan{Product: name})
+				if err != nil || n != 1 {
+					t.Fatalf("set test plan product: count=%d err=%v", n, err)
+				}
+			}
+			// Isolate reservation protection from the plan-reference guards.
+			setPlanProduct("")
 			if _, err := DeleteProduct(before); !errors.Is(err, ErrGroupCheckoutConflict) {
-				t.Fatal("generic delete erased pending stock")
+				t.Fatalf("pending reservation must reject deletion: %v", err)
 			}
 			before.DisplayName = "stale presentation"
 			if _, err := UpdateProduct(before.GetId(), before); !errors.Is(err, ErrGroupCheckoutConflict) {
-				t.Fatal("stale AllCols reset reserved quantity")
+				t.Fatalf("stale AllCols must reject reserved quantity: %v", err)
 			}
 			current, err := GetProduct(before.GetId())
 			if err != nil {
@@ -1292,6 +1316,7 @@ func TestTenantCheckoutReservedIntentSurvivesCatalogMutationAndGroupDisable(t *t
 					t.Fatal(err)
 				}
 			}
+			setPlanProduct(before.Name)
 			if _, _, err := PayGroupOrder(checkoutFixtureAdmission(second), payer.Owner+"_dummy", "internal.invalid", "en"); err == nil {
 				t.Fatal("new claim bypassed current catalog/Group eligibility")
 			}
@@ -1322,8 +1347,9 @@ func TestTenantCheckoutReservedIntentSurvivesCatalogMutationAndGroupDisable(t *t
 					t.Fatal("settlement re-enabled Group")
 				}
 			}
+			setPlanProduct("")
 			if ok, err := DeleteProduct(current); err != nil || !ok {
-				t.Fatal("fully settled product remained reservation-locked")
+				t.Fatalf("fully settled product remained reservation-locked: %v", err)
 			}
 			if paid, err := NotifyPayment(nil, payer.Owner, payment.Name, "en"); err != nil || paid.State != pp.PaymentStatePaid {
 				t.Fatal("Paid replay depended on current product existence")

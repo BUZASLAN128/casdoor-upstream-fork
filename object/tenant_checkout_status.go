@@ -171,7 +171,19 @@ func loadGroupTimeline(session *xorm.Session, owner, group string, now time.Time
 		return nil, ErrGroupCheckoutConflict
 	}
 	for _, payment := range paid {
-		if !seenPayments[payment.Name] {
+		if seenPayments[payment.Name] {
+			continue
+		}
+		order := &Order{}
+		found, err := session.ID(core.PK{owner, payment.Order}).Get(order)
+		if err != nil {
+			return nil, err
+		}
+		// A package is a purchase, not a paid period. Other unmatched Paid
+		// payments still make the timeline ambiguous.
+		if !found || order.State != "Paid" || order.CheckoutRevision < 3 || !payment.GroupStockReserved ||
+			!isTenantPackageCheckout(order.ProductInfos) || validateGroupOrderTerms(order, true) != nil ||
+			validateGroupPayment(order, payment) != nil {
 			return nil, ErrGroupCheckoutConflict
 		}
 	}
@@ -366,12 +378,13 @@ func getGroupCheckoutAt(principal, owner, group, actorName, orderName string, cl
 			}
 			if !intent && len(pending) == 0 && order.State == "Created" {
 				result.CanCancel = actor != nil && canonicalGroup.IsEnabled && order.CheckoutRevision >= 0
-				result.CanResume = actor != nil && actor.Name == order.User && result.CheckoutAvailable && order.CheckoutRevision > 0 && validateCheckoutTerms(order.CheckoutTerms, false) == nil
+				orderAvailable := result.CheckoutAvailable || (canonicalGroup.IsEnabled && isTenantPackageCheckout(order.ProductInfos))
+				result.CanResume = actor != nil && actor.Name == order.User && orderAvailable && order.CheckoutRevision > 0 && validateGroupOrderTerms(order, false) == nil
 				if result.CanResume {
 					_, err = validateUnattemptedGroupQuote(session, order, actor, timeline, now)
 					result.CanResume = err == nil
 				}
-			} else if len(pending) == 1 && order.Payment == pending[0].Name && validateGroupPayment(order, pending[0]) == nil && pending[0].State == pp.PaymentStateCreated && order.State == "Processing" && validateCheckoutTerms(order.CheckoutTerms, true) == nil {
+			} else if len(pending) == 1 && order.Payment == pending[0].Name && validateGroupPayment(order, pending[0]) == nil && pending[0].State == pp.PaymentStateCreated && order.State == "Processing" && validateGroupOrderTerms(order, true) == nil {
 				result.OpenOrder.PaymentState = pending[0].State
 				result.CanResume = actor != nil && actor.Name == order.User && canonicalGroup.IsEnabled && checkGroupPaymentType(pending[0].Type) == nil
 			} else {

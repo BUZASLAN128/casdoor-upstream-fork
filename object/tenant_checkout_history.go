@@ -198,9 +198,10 @@ func GetGroupCheckoutHistory(principal, owner, group string, limit int, token st
 	result := &GroupCheckoutHistory{ReadScope: "history", Owner: owner, Group: group, ServerNow: checkoutTimestamp(time.Now().UTC()), Items: []*GroupCheckoutHistoryItem{}}
 	orders := []*Order{}
 	query := session.Where("owner = ? AND "+quoteColumn("group")+" = ?", owner, group)
-	// The plan history contract requires a plan on every row. Package orders
-	// have a separate App history and exactly one SKU in this JSON list.
-	query = query.And("(products IS NULL OR products NOT LIKE ?)", `["`+tenantPackagePrefix+`%"]`)
+	// The stored single-SKU list has a canonical JSON prefix. REPLACE
+	// matches its case even on databases where LIKE ignores case.
+	packagePrefix := `["` + tenantPackagePrefix
+	query = query.And("(products IS NULL OR LENGTH(products) < ? OR LENGTH(REPLACE(SUBSTR(products, 1, ?), ?, '')) <> 0)", len(packagePrefix), len(packagePrefix), packagePrefix)
 	if cursor != nil {
 		query = query.And("(created_time < ? OR (created_time = ? AND name < ?))", cursor.CreatedTime, cursor.CreatedTime, cursor.Name)
 	}
@@ -214,6 +215,10 @@ func GetGroupCheckoutHistory(principal, owner, group string, limit int, token st
 	for _, order := range orders {
 		if order.Owner != owner || order.Group != group {
 			return nil, ErrGroupCheckoutUnavailable
+		}
+		// Recognize package rows even if their JSON list has been reformatted.
+		if isTenantPackageCheckout(order.ProductInfos) && validateGroupOrderTerms(order, order.State == "Paid" || order.State == "Processing") == nil {
+			continue
 		}
 		var payment *Payment
 		if order.Payment != "" {
