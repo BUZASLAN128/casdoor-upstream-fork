@@ -50,7 +50,7 @@ jobs:
           build-args: |
             SOURCE_REVISION=${{ github.sha }}
           tags: |
-            ghcr.io/buzaslan129/casdoor-cockroach:4.29.0-cerberus.1-${{ github.sha }}
+            ghcr.io/buzaslan128/casdoor-cockroach:4.29.0-cerberus.1-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
