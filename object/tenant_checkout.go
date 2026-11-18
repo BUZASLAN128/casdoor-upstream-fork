@@ -50,13 +50,13 @@ func CheckTenantCheckoutRequest(principal, owner, group string, infos []ProductI
 		return err
 	}
 	if group != "" {
-		if config.application == "" || principal != config.application || owner != config.organization || len(infos) != 1 || infos[0].PricingName != config.pricing {
+		if config.application == "" || principal != config.application || owner != config.organization || !matchesTenantCheckoutProduct(infos, config.pricing) {
 			return ErrTenantCheckoutRequired
 		}
 		return nil
 	}
 	for _, info := range infos {
-		if config.pricing != "" && owner == config.organization && info.PricingName == config.pricing {
+		if strings.HasPrefix(info.Name, tenantPackagePrefix) || (config.pricing != "" && owner == config.organization && info.PricingName == config.pricing) {
 			return ErrTenantCheckoutRequired
 		}
 	}
@@ -93,13 +93,27 @@ func validateTenantCheckout(owner, groupName string, user *User, infos []Product
 
 func validateTenantCheckoutInSession(session *xorm.Session, owner, groupName string, user *User, infos []ProductInfo) (*Product, error) {
 	config, err := getTenantCheckoutConfig()
-	if err != nil || config.application == "" || owner != config.organization || len(infos) != 1 || infos[0].PricingName != config.pricing {
+	if err != nil || config.application == "" || owner != config.organization || !matchesTenantCheckoutProduct(infos, config.pricing) {
 		return nil, ErrTenantCheckoutRequired
 	}
 	if err := validateTenantCheckoutIdentity(owner, groupName, user, infos); err != nil {
 		return nil, err
 	}
 	info := infos[0]
+	if isTenantPackageCheckout(infos) {
+		product := &Product{}
+		found, err := session.ID(core.PK{owner, info.Name}).Get(product)
+		if err != nil {
+			return nil, err
+		}
+		if !found || validateTenantPackageProduct(product) != nil {
+			return nil, ErrGroupCheckoutConflict
+		}
+		if err := requireGroupProductProvider(session, product); err != nil {
+			return nil, err
+		}
+		return product, nil
+	}
 	pricing, plan, product := &Pricing{}, &Plan{}, &Product{}
 	pricingFound, err := session.ID(core.PK{owner, info.PricingName}).Get(pricing)
 	if err != nil {
@@ -126,7 +140,7 @@ func validateTenantCheckoutIdentity(owner, groupName string, user *User, infos [
 	if groupName == "" || strings.Contains(groupName, "/") || user == nil || user.Owner != owner || user.Name == "" || user.IsDeleted || user.IsForbidden {
 		return fmt.Errorf("invalid tenant checkout target or payer")
 	}
-	if len(infos) != 1 || infos[0].Quantity != 1 || infos[0].PricingName == "" || infos[0].PlanName == "" {
+	if !isTenantPackageCheckout(infos) && (len(infos) != 1 || infos[0].Quantity != 1 || infos[0].PricingName == "" || infos[0].PlanName == "") {
 		return fmt.Errorf("tenant checkout requires one pricing plan")
 	}
 	return nil
@@ -179,7 +193,8 @@ func placeGroupOrderAt(principal, owner, groupName string, infos []ProductInfo, 
 	if err := CheckTenantCheckoutPrincipal(principal, owner); err != nil {
 		return nil, err
 	}
-	if expected != "none" && !validPeriodRevision(expected) {
+	packageCheckout := isTenantPackageCheckout(infos)
+	if expected != "none" && (packageCheckout || !validPeriodRevision(expected)) {
 		return nil, ErrGroupCheckoutConflict
 	}
 	if err := validateTenantCheckout(owner, groupName, user, infos); err != nil {
@@ -213,22 +228,27 @@ func placeGroupOrderAt(principal, owner, groupName string, infos []ProductInfo, 
 	if err != nil {
 		return nil, err
 	}
-	plan := &Plan{}
-	found, err = session.ID(core.PK{owner, infos[0].PlanName}).Get(plan)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, ErrGroupCheckoutConflict
-	}
 	now := clock().UTC()
-	timeline, err := loadGroupTimeline(session, owner, groupName, now)
-	if err != nil {
-		return nil, err
-	}
-	terms, err := newCheckoutTerms(timeline, expected, plan.Period, now)
-	if err != nil {
-		return nil, err
+	var timeline *groupPeriodTimeline
+	packageTerms := tenantPackageTerms
+	terms := &packageTerms
+	if !packageCheckout {
+		plan := &Plan{}
+		found, err := session.ID(core.PK{owner, infos[0].PlanName}).Get(plan)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, ErrGroupCheckoutConflict
+		}
+		timeline, err = loadGroupTimeline(session, owner, groupName, now)
+		if err != nil {
+			return nil, err
+		}
+		terms, err = newCheckoutTerms(timeline, expected, plan.Period, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 	pending, err := unresolvedGroupPayments(session, owner, groupName)
 	if err != nil {
@@ -278,6 +298,12 @@ func validateUnattemptedGroupQuote(session *xorm.Session, order *Order, payer *U
 	product, err := validateTenantCheckoutInSession(session, order.Owner, order.Group, payer, order.ProductInfos)
 	if err != nil {
 		return nil, err
+	}
+	if isTenantPackageCheckout(order.ProductInfos) {
+		if validateGroupOrderTerms(order, false) != nil || product.Price != order.Price || product.Currency != order.Currency {
+			return nil, ErrGroupCheckoutConflict
+		}
+		return product, nil
 	}
 	plan := &Plan{}
 	found, err := session.ID(core.PK{order.Owner, order.ProductInfos[0].PlanName}).Get(plan)
@@ -402,13 +428,17 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 	if result.PaymentStatus == pp.PaymentStatePaid && (result.Price != stored.Price || result.Currency != stored.Currency) {
 		return nil, ErrGroupCheckoutConflict
 	}
+	packageCheckout := isTenantPackageCheckout(order.ProductInfos)
+	if packageCheckout && (order.CheckoutRevision < 2 || validateGroupOrderTerms(order, true) != nil) {
+		return nil, ErrGroupCheckoutConflict
+	}
 	if pp.IsTerminalState(stored.State) {
 		if (stored.State == pp.PaymentStatePaid && order.State != "Paid") || (stored.State != pp.PaymentStatePaid && result.PaymentStatus == pp.PaymentStatePaid) {
 			// Retain attribution for bounded audit/reconciliation; never report
 			// a contradictory late success as a refund or revive a replacement.
 			return stored, ErrGroupCheckoutConflict
 		}
-		if stored.State == pp.PaymentStatePaid {
+		if stored.State == pp.PaymentStatePaid && !packageCheckout {
 			sub := &Subscription{}
 			found, err := session.ID(core.PK{order.Owner, "sub_" + order.Name}).Get(sub)
 			if err != nil {
@@ -429,7 +459,7 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 	if order.State != "Created" && order.State != "Processing" {
 		return nil, ErrGroupCheckoutConflict
 	}
-	if order.State != "Processing" || validateCheckoutTerms(order.CheckoutTerms, true) != nil {
+	if order.State != "Processing" || validateGroupOrderTerms(order, true) != nil {
 		return nil, ErrGroupCheckoutConflict
 	}
 	now := clock().UTC()
@@ -445,8 +475,10 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 		if len(order.ProductInfos) != 1 {
 			return nil, fmt.Errorf("invalid tenant order product")
 		}
-		if err := validateGroupSettlementTerms(session, order, now); err != nil {
-			return nil, err
+		if !packageCheckout {
+			if err := validateGroupSettlementTerms(session, order, now); err != nil {
+				return nil, err
+			}
 		}
 		others, err := groupOpenOrders(session, order.Owner, order.Group)
 		if err != nil {
@@ -463,16 +495,18 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 		if stock == nil {
 			return nil, ErrGroupCheckoutConflict
 		}
-		terms := order.CheckoutTerms
-		sub := &Subscription{Owner: order.Owner, Name: "sub_" + order.Name, DisplayName: "Subscription - " + order.Name, CreatedTime: checkoutTimestamp(now),
-			Group: order.Group, Plan: info.PlanName, Pricing: info.PricingName, Payment: stored.Name,
-			StartTime: terms.StartTime, EndTime: terms.EndTime, Period: terms.Period, State: SubStateActive}
-		sub.State, err = effectiveGroupPeriodState(sub, now)
-		if err != nil {
-			return nil, err
-		}
-		if _, err = session.Insert(sub); err != nil {
-			return nil, err
+		if !packageCheckout {
+			terms := order.CheckoutTerms
+			sub := &Subscription{Owner: order.Owner, Name: "sub_" + order.Name, DisplayName: "Subscription - " + order.Name, CreatedTime: checkoutTimestamp(now),
+				Group: order.Group, Plan: info.PlanName, Pricing: info.PricingName, Payment: stored.Name,
+				StartTime: terms.StartTime, EndTime: terms.EndTime, Period: terms.Period, State: SubStateActive}
+			sub.State, err = effectiveGroupPeriodState(sub, now)
+			if err != nil {
+				return nil, err
+			}
+			if _, err = session.Insert(sub); err != nil {
+				return nil, err
+			}
 		}
 		// Tenant plans cannot recharge a wallet. Keep normal purchase bookkeeping.
 		transaction := &Transaction{Owner: order.Owner, Name: "purchase_" + stored.Name, DisplayName: stored.Name, CreatedTime: util.GetCurrentTime(), Amount: -stored.Price, Currency: stored.Currency, Payment: stored.Name, Category: TransactionCategoryPurchase, Type: "Payment", Subtype: stored.Type, Provider: stored.Provider, Tag: "User", User: stored.User, State: string(pp.PaymentStatePaid)}
@@ -497,6 +531,14 @@ func completeGroupPaymentAt(payment *Payment, result *pp.NotifyResult, notifyErr
 	}
 	if _, err = session.ID(core.PK{order.Owner, order.Name}).Cols("state", "message", "update_time", "checkout_revision").Update(order); err != nil {
 		return nil, err
+	}
+	if packageCheckout {
+		// Package fulfillment is handled by App. The existing mail describes
+		// a subscription and applies only to plans.
+		if err := session.Commit(); err != nil {
+			return nil, err
+		}
+		return stored, nil
 	}
 	return finishGroupPayment(session.Commit, stored, previousState, notifyGroupPaymentEmail)
 }

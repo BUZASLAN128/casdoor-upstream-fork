@@ -83,8 +83,18 @@ func groupPaymentResultURL(frontend, owner, pricing, payment string) string {
 	return fmt.Sprintf("%s/buy-plan/%s/%s/result?payment=%s", frontend, url.PathEscape(owner), url.PathEscape(pricing), url.QueryEscape(payment))
 }
 
+func groupOrderPaymentResultURL(frontend string, order *Order, payment string) string {
+	pricing := order.ProductInfos[0].PricingName
+	if isTenantPackageCheckout(order.ProductInfos) {
+		// The public result page looks up payments by ID. It only looks up
+		// pricing when a subscription query parameter is present.
+		pricing = "ai-budget"
+	}
+	return groupPaymentResultURL(frontend, order.Owner, pricing, payment)
+}
+
 func validateGroupPaymentResponse(order *Order, payment *Payment) error {
-	if validateGroupPayment(order, payment) != nil || !payment.GroupStockReserved || validateCheckoutTerms(order.CheckoutTerms, true) != nil || order.CheckoutRevision < 2 {
+	if validateGroupPayment(order, payment) != nil || !payment.GroupStockReserved || validateGroupOrderTerms(order, true) != nil || order.CheckoutRevision < 2 {
 		return ErrGroupCheckoutConflict
 	}
 	if (payment.State == pp.PaymentStateCreated && order.State != "Processing") || (payment.State == pp.PaymentStatePaid && order.State != "Paid") || (payment.State != pp.PaymentStateCreated && payment.State != pp.PaymentStatePaid) {
@@ -97,7 +107,7 @@ func validateGroupPaymentResponse(order *Order, payment *Payment) error {
 	if len(order.ProductInfos) != 1 {
 		return ErrGroupCheckoutConflict
 	}
-	expected := groupPaymentResultURL(frontend, order.Owner, order.ProductInfos[0].PricingName, payment.Name)
+	expected := groupOrderPaymentResultURL(frontend, order, payment.Name)
 	if payment.PayUrl != expected || payment.SuccessUrl != expected {
 		return ErrGroupCheckoutUnavailable
 	}
@@ -186,7 +196,7 @@ func newGroupPaymentIntent(order *Order, payer *User, product *Product, provider
 	if err != nil {
 		return nil, nil, err
 	}
-	success := groupPaymentResultURL(frontend, order.Owner, order.ProductInfos[0].PricingName, name)
+	success := groupOrderPaymentResultURL(frontend, order, name)
 	dummyID, err := json.Marshal(pp.DummyOrderInfo{Price: order.Price, Currency: order.Currency})
 	if err != nil {
 		return nil, nil, ErrGroupCheckoutUnavailable
@@ -283,9 +293,13 @@ func claimGroupPaymentAt(providerName, host string, admission GroupPaymentAdmiss
 		return nil, nil, ErrGroupCheckoutConflict
 	}
 	now := clock().UTC()
-	timeline, err := loadGroupTimeline(session, order.Owner, order.Group, now)
-	if err != nil {
-		return nil, nil, err
+	packageCheckout := isTenantPackageCheckout(order.ProductInfos)
+	var timeline *groupPeriodTimeline
+	if !packageCheckout {
+		timeline, err = loadGroupTimeline(session, order.Owner, order.Group, now)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	product, err := validateUnattemptedGroupQuote(session, order, payer, timeline, now)
 	if err != nil {
@@ -309,9 +323,12 @@ func claimGroupPaymentAt(providerName, host string, admission GroupPaymentAdmiss
 	if len(pending) != 0 || intent || len(orders) != 1 || orders[0].Name != order.Name {
 		return nil, nil, ErrGroupCheckoutConflict
 	}
-	terms, err := claimCheckoutTerms(order.CheckoutTerms, timeline, now)
-	if err != nil {
-		return nil, nil, err
+	terms := order.CheckoutTerms
+	if !packageCheckout {
+		terms, err = claimCheckoutTerms(order.CheckoutTerms, timeline, now)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	revision, err := nextCheckoutRevision(order.CheckoutRevision)
 	if err != nil {
