@@ -14,7 +14,7 @@ import * as Setting from "@/lib/setting";
 /** Payment types the frontend nudges with /api/notify-payment while they are pending. */
 const NOTIFIABLE = ["PayPal", "Stripe", "AirWallex", "Alipay", "WeChat Pay", "Balance", "Dummy"];
 
-// The only result a signed-out payer is sent back to after login; LoginPage's TENANT_RESULT_RETURN is the same pattern.
+// The only result a signed-out payer is sent back to after login (passed to LoginPage as state.from).
 const TENANT_RESULT = /^\/buy-plan\/[^/?#]+\/[^/?#]+\/result\?payment=payment_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 type Status = "success" | "info" | "warning" | "error";
@@ -66,8 +66,7 @@ export default function PaymentResultPage() {
 
   React.useEffect(() => {
     if (loginReturn) {
-      sessionStorage.setItem("from", here);
-      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true});
+      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true, state: {from: here}});
     }
   }, [loginReturn, here, navigate, owner]);
 

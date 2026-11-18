@@ -46,9 +46,8 @@ function PricingOrderPay({owner, pricingName, orderName}: {owner: string; pricin
   React.useEffect(() => {
     const here = location.pathname + location.search;
     if (signedOut) {
-      // the login page returns here once signed in
-      sessionStorage.setItem("from", here);
-      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true});
+      // the login page keeps state.from as its return link
+      navigate(`/login/${encodeURIComponent(owner)}`, {replace: true, state: {from: here}});
     } else if (account && sessionStorage.getItem("from") === here) {
       // back from login: later sign-ins in this tab must not return to this order
       sessionStorage.removeItem("from");
